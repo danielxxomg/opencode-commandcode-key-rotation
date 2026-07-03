@@ -1,20 +1,9 @@
 {
+  "$schema": "https://opencode.ai/config.json",
   "keys": [
-    {
-      "name": "personal",
-      "key": "user_test_0000aaaa",
-      "account": "myaccount"
-    },
-    {
-      "name": "work",
-      "key": "user_test_0000bbbb",
-      "account": "work-org"
-    },
-    {
-      "name": "backup",
-      "key": "user_test_0000cccc",
-      "account": "myaccount"
-    }
+    { "name": "personal", "key": "user_YOUR_KEY_1", "account": "myaccount" },
+    { "name": "work",     "key": "user_YOUR_KEY_2", "account": "work-org" },
+    { "name": "backup",   "key": "user_YOUR_KEY_3", "account": "myaccount" }
   ],
   "rotation": {
     "strategy": "weighted-random",
@@ -22,12 +11,16 @@
     "cooldownFromRetryAfter": true,
     "serverErrorCooldownMs": 10000,
     "scoreDecayPerHour": 1,
-    "maxSuccessBonus": 50
+    "maxSuccessBonus": 50,
+    "lockTimeoutMs": 300000,
+    "costPerDollar": 2.0,
+    "_comment_scoringWeights": "Optional: { \"costPerDollar\": 2.0 } overrides costPerDollar for the cost-aware scoring penalty. Omit to use costPerDollar (default 2.0 — each $1 spent subtracts 2 score points)."
   },
   "notifications": {
     "onRotate": true,
     "onCooldown": true,
     "onRecovery": true,
-    "onPermanentDeath": true
+    "onPermanentDeath": true,
+    "onLockRelease": true
   }
 }

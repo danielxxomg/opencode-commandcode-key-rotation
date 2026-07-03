@@ -50,9 +50,14 @@ function readKeyStateSafe(): KeyState {
     }
     return {
       activeKey: parsed.activeKey ?? null,
+      // Keys pass through with all optional Phase 3 cost/lock fields intact
+      // (KeyStateEntry fields are optional, so old files parse without migration).
       keys: Array.isArray(parsed.keys) ? parsed.keys : [],
       notifications: parsed.notifications,
       lastRotation: parsed.lastRotation,
+      configWarning: parsed.configWarning,
+      // Phase 3: active locks summary
+      activeLocks: Array.isArray(parsed.activeLocks) ? parsed.activeLocks : undefined,
     }
   } catch {
     return { activeKey: null, keys: [] }
@@ -128,6 +133,12 @@ const tui: TuiPlugin = async (api) => {
           if (toast.show) api.ui.toast({ variant: toast.variant, title: toast.title, message: toast.message })
         }
       }
+
+      // Phase 3: lock-release toast — a key that was locked is now unlocked.
+      if (newKey.locked !== true && oldKey.locked === true) {
+        const toast = decideToast("lockRelease", { keyName: newKey.name }, newState, dismissedNotifications)
+        if (toast.show) api.ui.toast({ variant: toast.variant, title: toast.title, message: toast.message })
+      }
     }
 
     prevState = newState
@@ -144,6 +155,15 @@ const tui: TuiPlugin = async (api) => {
       if (newState.activeKey !== prevState.activeKey && newState.activeKey) {
         const toast = decideToast("rotate", { fromKey: prevState.activeKey ?? "none" }, newState, dismissedNotifications)
         if (toast.show) api.ui.toast({ variant: toast.variant, title: toast.title, message: toast.message })
+      }
+
+      // Phase 3: lock-release toast on lock→unlock transition
+      for (const newKey of newState.keys) {
+        const oldKey = prevState.keys.find((k) => k.name === newKey.name)
+        if (oldKey && oldKey.locked === true && newKey.locked !== true) {
+          const toast = decideToast("lockRelease", { keyName: newKey.name }, newState, dismissedNotifications)
+          if (toast.show) api.ui.toast({ variant: toast.variant, title: toast.title, message: toast.message })
+        }
       }
 
       prevState = newState
@@ -199,7 +219,7 @@ const tui: TuiPlugin = async (api) => {
           const type = ctx.input?.trim()
           if (!type) {
             // No arg: show the dismiss menu
-            const types = ["rotate", "cooldown", "recovery", "permanent-death"]
+            const types = ["rotate", "cooldown", "recovery", "permanent-death", "lock-release"]
             api.ui.dialog.replace(
               () => (
                 <box flexDirection="column" padding={1}>
