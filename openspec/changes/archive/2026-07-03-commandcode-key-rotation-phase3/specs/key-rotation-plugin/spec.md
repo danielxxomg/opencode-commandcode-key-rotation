@@ -1,14 +1,12 @@
-# Key Rotation Plugin Specification
+# Delta for Key Rotation Plugin
 
-## Purpose
-
-Server + TUI plugin for key rotation. Server reads `keys.json`, injects `apiKeys[]` into provider config, monitors errors, writes state to `key-state.json`. TUI displays active key in sidebar footer, fires toast notifications, exposes `/key-status` command.
-
-## ADDED Requirements
+## MODIFIED Requirements
 
 ### Requirement: Config Reading
 
-The server plugin `config` hook MUST read `~/.commandcode/keys.json` and inject `apiKeys[]` into the commandcode provider config. It MUST also load `models.json` to build a cost map and pass it as `modelCosts` to the provider options. If `keys.json` is missing or malformed, the system MUST fall back to legacy single-key mode and emit a warning (not crash). If `models.json` is missing or malformed, cost tracking MUST be disabled (no crash). The config hook MUST override any single `apiKey` injection from the existing `commandcode-go-opencode-provider/server` plugin.
+The server plugin `config` hook MUST read `~/.commandcode/keys.json` and inject `apiKeys[]` into the commandcode provider config. It MUST also load `models.json` to build a cost map and pass it as `modelCosts` to the provider options. If `keys.json` is missing or malformed, the system MUST fall back to legacy single-key mode and emit a warning (not crash). If `models.json` is missing or malformed, cost tracking MUST be disabled (no crash).
+
+(Previously: No models.json loading or cost map injection)
 
 #### Scenario: Malformed keys.json → fallback + warning
 
@@ -39,6 +37,8 @@ The server plugin `config` hook MUST read `~/.commandcode/keys.json` and inject 
 
 The server plugin MUST write key state to `~/.commandcode/key-state.json` (active key name, health snapshot, last rotation timestamp). The state MUST include per-key cost data (`totalCostUSD`, `totalInputTokens`, `totalOutputTokens`, `modelUsage`) and lock state (active locks). Writes MUST be atomic (write to temp file + rename). Reads MUST tolerate partial/malformed JSON (fall back to last-known state, not crash).
 
+(Previously: No cost data or lock state in key-state.json)
+
 #### Scenario: Atomic key-state.json write
 
 - GIVEN the server plugin is writing key state
@@ -57,19 +57,11 @@ The server plugin MUST write key state to `~/.commandcode/key-state.json` (activ
 - WHEN TUI reads `key-state.json`
 - THEN lock information is available for display
 
-### Requirement: api.kv vs File State
-
-`api.kv` (TUI) SHOULD be used for TUI-side persistence across sessions. `key-state.json` (file) MUST be used for server-TUI communication (server writes, TUI reads). Both coexist; they are NOT redundant.
-
-#### Scenario: TUI persists dismissed notification via kv
-
-- GIVEN user dismisses a "key rotated" toast
-- WHEN the TUI session restarts
-- THEN the dismissed state is restored from `api.kv`
-
 ### Requirement: TUI Display
 
 The TUI plugin MUST register a `sidebar_footer` slot showing: active key name + account + health indicator + "N keys | M healthy" + total est. cost (`💰 $X.XX`) + lock count (`🔒 N locked`). Keys MUST NOT be displayed — only name + last 4 chars.
+
+(Previously: Sidebar showed key name, account, health, key count, healthy count — no cost or lock info)
 
 #### Scenario: Sidebar shows key summary with cost and locks
 
@@ -83,25 +75,11 @@ The TUI plugin MUST register a `sidebar_footer` slot showing: active key name + 
 - WHEN sidebar renders
 - THEN cost and lock indicators are omitted (backward compat)
 
-### Requirement: Toast Notifications
-
-The TUI MUST fire toasts for: `onRotate` (key switched), `onCooldown` (key entered cooldown), `onRecovery` (key back online), `onPermanentDeath` (key auth-failed), `onLockRelease` (lock released). Toasts MUST NOT include full keys (redacted).
-
-#### Scenario: Rotation toast fires
-
-- GIVEN key A rotates to key B
-- WHEN the rotation event fires
-- THEN a toast shows "personal → work" (names only, no keys)
-
-#### Scenario: Lock release toast fires
-
-- GIVEN key "personal" lock is released
-- WHEN the lock release event fires
-- THEN a toast shows "personal lock released"
-
 ### Requirement: /key-status Command
 
 The TUI MUST register a `/key-status` command via `api.keymap.registerLayer` showing all keys: name, account, health indicator, score, cooldown remaining, status, tokens (in/out), est. cost, lock owner. Below the table, a summary section MUST show total cost, total tokens, top model, and per-model cost breakdown.
+
+(Previously: /key-status showed name, account, health, score, cooldown, status — no tokens, cost, lock, or model breakdown)
 
 #### Scenario: /key-status displays enhanced columns
 
@@ -121,12 +99,20 @@ The TUI MUST register a `/key-status` command via `api.keymap.registerLayer` sho
 - WHEN `/key-status` renders
 - THEN lock owner column shows "a852…" for "personal", "—" for unlocked keys
 
-### Requirement: Config Hot-Reload
+### Requirement: Toast Notifications
 
-When `keys.json` changes, the next `selectKey()` call MUST read the updated config. The system MUST NOT require a restart.
+The TUI MUST fire toasts for: `onRotate` (key switched), `onCooldown` (key entered cooldown), `onRecovery` (key back online), `onPermanentDeath` (key auth-failed), `onLockRelease` (lock released). Toasts MUST NOT include full keys (redacted).
 
-#### Scenario: keys.json updated → next selection uses new keys
+(Previously: No `onLockRelease` toast)
 
-- GIVEN initial config has keys A, B
-- WHEN `keys.json` is updated to add key C
-- THEN the next `selectKey()` call includes key C in the eligible pool
+#### Scenario: Rotation toast fires
+
+- GIVEN key A rotates to key B
+- WHEN the rotation event fires
+- THEN a toast shows "personal → work" (names only, no keys)
+
+#### Scenario: Lock release toast fires
+
+- GIVEN key "personal" lock is released
+- WHEN the lock release event fires
+- THEN a toast shows "personal lock released"

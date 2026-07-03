@@ -3,7 +3,7 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6.svg)
 ![Bun](https://img.shields.io/badge/Bun-%3E%3D1.0.0-fbf0d9.svg)
-![Tests](https://img.shields.io/badge/tests-115%20pass-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-246%20pass-brightgreen.svg)
 ![Coverage](https://img.shields.io/badge/coverage-%3E80%25-brightgreen.svg)
 ![Strict TDD](https://img.shields.io/badge/TDD-strict-orange.svg)
 
@@ -88,13 +88,16 @@ Multi-key config with rotation and notification settings:
     "cooldownFromRetryAfter": true,
     "serverErrorCooldownMs": 10000,
     "scoreDecayPerHour": 1,
-    "maxSuccessBonus": 50
+    "maxSuccessBonus": 50,
+    "lockTimeoutMs": 300000,
+    "costPerDollar": 2.0
   },
   "notifications": {
     "onRotate": true,
     "onCooldown": true,
     "onRecovery": true,
-    "onPermanentDeath": true
+    "onPermanentDeath": true,
+    "onLockRelease": true
   }
 }
 ```
@@ -110,7 +113,10 @@ Multi-key config with rotation and notification settings:
 | `rotation.serverErrorCooldownMs` | `10000` | Cooldown after 5xx server errors (ms) |
 | `rotation.scoreDecayPerHour` | `1` | Health score decay for inactivity |
 | `rotation.maxSuccessBonus` | `50` | Max bonus from successful requests |
-| `notifications.*` | `true` | Toggle toast notifications per event type |
+| `rotation.lockTimeoutMs` | `300000` | Phase 3: cross-instance lock TTL (ms). Prevents two instances using the same key simultaneously |
+| `rotation.costPerDollar` | `2.0` | Phase 3: cost-aware scoring weight (each $1 est. spent → score penalty) |
+| `rotation.scoringWeights` | — | Phase 3: optional `{ "costPerDollar": N }` overriding `costPerDollar` |
+| `notifications.*` | `true` | Toggle toast notifications per event type (`onLockRelease` = Phase 3 lock-release toast) |
 
 ### `~/.config/opencode/opencode.json`
 
@@ -138,12 +144,13 @@ Multi-key config with rotation and notification settings:
 
 | Layer | Location | Role |
 |-------|----------|------|
-| **Provider** | `providers/commandcode-retry/src/key-manager.ts` | KeyManager: health scoring, weighted random selection, cooldown, permanent death, hot-reload |
-| **Provider** | `providers/commandcode-retry/src/model.ts` | `fetchWithRetry()` + `streamWithReconnect()` key swap on 429/quota/auth errors |
-| **Provider** | `providers/commandcode-retry/index.ts` | Factory: accepts `apiKeys[]`, constructs KeyManager, backward-compat single `apiKey` |
-| **Server Plugin** | `providers/commandcode-key-rotation/server.ts` | Config hook reads `keys.json`, event hook monitors `session.error`, atomic `key-state.json` |
-| **TUI Plugin** | `providers/commandcode-key-rotation/ui.tsx` | `sidebar_footer` slot, toast notifications, `/key-status`, `/key-dismiss` |
-| **TUI Logic** | `providers/commandcode-key-rotation/ui-logic.ts` | Pure functions: formatting, redaction, toast decisions, notification gating |
+| **Provider** | `providers/commandcode-retry/src/lock-manager.ts` | Phase 3: per-key `O_EXCL` file locks at `~/.commandcode/.key-locks/` — acquire/release/refresh + 5min auto-release |
+| **Provider** | `providers/commandcode-retry/src/key-manager.ts` | KeyManager: health scoring, weighted random selection, cooldown, permanent death, hot-reload, cost tracking, lock-aware selection, cost-aware scoring |
+| **Provider** | `providers/commandcode-retry/src/model.ts` | `fetchWithRetry()` (sole key-selection authority) + `streamWithReconnect()` key swap on 429/quota/auth; lock lifecycle (acquire/refresh/release) + transparent usage/cost capture |
+| **Provider** | `providers/commandcode-retry/index.ts` | Factory: accepts `apiKeys[]` + Phase 3 options (`modelCosts`, `lockManager`, `costPerDollar`, `instanceId`, `lockTimeoutMs`); backward-compat single `apiKey` |
+| **Server Plugin** | `providers/commandcode-key-rotation/server.ts` | Config hook reads `keys.json` + `models.json` (cost map), creates the shared `LockManager` + instance UUID, injects provider options, atomic `key-state.json` with cost + lock data |
+| **TUI Plugin** | `providers/commandcode-key-rotation/ui.tsx` | `sidebar_footer` slot (💰 est. cost + 🔒 locks), toast notifications (incl. lock-release), `/key-status`, `/key-dismiss` |
+| **TUI Logic** | `providers/commandcode-key-rotation/ui-logic.ts` | Pure functions: formatting (cost/tokens/model breakdown/lock owner), redaction, toast decisions, notification gating |
 
 Key rotation happens **inside the provider** (`fetchWithRetry()`), not in a plugin hook — the only interception point that works transparently for sub-agents.
 
@@ -157,7 +164,11 @@ score = 100
       − (rateLimitHits × 10)      // penalty per 429
       − (authErrors × 1000)       // nuclear penalty for auth failures
       − (agePenalty)              // mild penalty for inactivity (1 point/hour)
+      − (estCostUSD × costPerDollar)  // Phase 3: cost-aware penalty (default 2.0 per $1 est. spent)
 ```
+
+> [!NOTE]
+> The cost penalty uses **estimated** cost (tokens × model pricing). It only applies when a `models.json` cost map is configured. With no cost map, scoring is identical to phase 1+2.
 
 | Event | Effect | Cooldown | Notification |
 |-------|--------|----------|-------------|
@@ -172,11 +183,13 @@ score = 100
 **Selection algorithm (`selectKey()`):**
 
 1. Filter out permanently-dead keys and keys in cooldown
-2. If none eligible → use least-recently-cooldowned non-dead key (emergency fallback + warning)
-3. If single key eligible → return it directly (no random)
-4. If all eligible keys have score 0 → uniform random (avoid divide-by-zero)
-5. Weighted random: `P(key_i) = score_i / Σscores`
-6. If all keys permanently dead → fatal error listing all keys + status
+2. Phase 3: prefer keys NOT locked by another instance (lock-aware selection)
+3. If none eligible → use least-recently-cooldowned non-dead key (emergency fallback + warning)
+4. If all eligible keys are locked by other instances → use the one whose lock expires soonest + warning
+5. If single key eligible → return it directly (no random)
+6. If all eligible keys have score 0 → uniform random (avoid divide-by-zero)
+7. Weighted random: `P(key_i) = score_i / Σscores`
+8. If all keys permanently dead → fatal error listing all keys + status
 
 ## Edge Cases
 
@@ -192,19 +205,24 @@ score = 100
 | Mid-stream exhaustion (after content) | `partialOutputError()` — cannot reconnect (duplicate-content risk) |
 | Malformed `keys.json` | Fall back to single-key legacy mode + warning toast |
 | `Retry-After` header present | Use header value as cooldown (capped at 300s) |
+| Two instances pick the same key (Phase 3) | Per-key `O_EXCL` lock prevents double-use; the second instance selects another unlocked key |
+| All keys locked by other instances (Phase 3) | Use the key whose lock expires soonest + warning (no deadlock) |
+| Instance crashes mid-stream (Phase 3) | Its lock auto-releases after `lockTimeoutMs` (default 5min); key becomes available again |
 
 ## TUI
 
 ### Sidebar Footer
 
-Shows the active key with health indicator:
+Shows the active key with health indicator, key counts, total estimated cost, and active locks:
 
 ```
-┌─ Key Rotation ────────────┐
-│ personal (myaccount) ✅   │
-│ 📊 3 keys | 2 healthy     │
-└───────────────────────────┘
+┌─ Key Rotation ─────────────────────────────────┐
+│ personal (myaccount) ✅                         │
+│ 📊 3 keys | 2 healthy | 💰 $0.42 | 🔒 1 locked  │
+└─────────────────────────────────────────────────┘
 ```
+
+> The `💰` (total est. cost) and `🔒` (lock count) indicators only appear when a `models.json` cost map is configured and locks are active — otherwise the sidebar renders identically to phase 1+2.
 
 ### Toast Notifications
 
@@ -213,12 +231,13 @@ Shows the active key with health indicator:
 ✅ Key Restored: 'personal' back online
 🔴 Key Disabled: 'backup' auth failed — permanently removed
 ⚠️ Configuration Warning: keys.json is malformed — using single-key mode
+🔓 Key 'work' lock released
 ```
 
 ### Commands
 
-- **`/key-status`** — detailed view of all keys (name, account, health, score, cooldown, status)
-- **`/key-dismiss`** — dismiss a notification type (persists across sessions via `api.kv`)
+- **`/key-status`** — detailed table of all keys: name, account, health, score, cooldown, status, **tokens (in/out)**, **est. cost**, **lock owner**. Below the table: a **Summary** (total est. cost, total tokens, top model) and a per-**model breakdown**.
+- **`/key-dismiss`** — dismiss a notification type, incl. `lock-release` (persists across sessions via `api.kv`)
 
 ## Debugging
 
@@ -265,8 +284,21 @@ This logs the full HTTP status + response body (with API keys redacted to last 4
 
 ### Toast notifications not appearing
 
-- Check `notifications` config in `keys.json` — all 4 types default to `true`
+- Check `notifications` config in `keys.json` — all 5 types default to `true` (incl. `onLockRelease`)
 - If you dismissed a notification type via `/key-dismiss`, it's persisted in `api.kv`. Run `/key-dismiss` again to toggle it back on
+
+### Lock file errors (Phase 3)
+
+- Lock files live at `~/.commandcode/.key-locks/{sanitized-key-name}/` and auto-release after `rotation.lockTimeoutMs` (default 5min)
+- If an instance crashed and left a stale lock, it clears automatically on timeout. To force-clear: `rm -rf ~/.commandcode/.key-locks/`
+- "All keys locked by other instances" warnings are expected when running several instances — the fallback picks the lock that expires soonest; it is not a deadlock
+- Permissions errors creating `.key-locks/`: ensure `~/.commandcode/` is writable. The directory is auto-created on first lock acquire
+
+### Cost estimation disclaimer (Phase 3)
+
+- The `💰` totals and `/key-status` cost columns are **estimates** computed locally as `tokens × model pricing` from `models.json`. They are **not** billing data and will not match your Command Code invoice exactly
+- If `models.json` is missing or a model has no `cost` entry, that model's usage accumulates tokens but contributes $0 to the estimate
+- Cost figures persist cumulatively in `~/.commandcode/key-state.json` (never auto-reset). To reset: delete the `totalCostUSD` / `modelUsage` fields from that file
 
 ## FAQ
 
@@ -285,7 +317,19 @@ Sub-agents share the parent's `LanguageModelV3` instance (cached by opencode's `
 <details>
 <summary><b>Can I run multiple OpenCode instances simultaneously?</b></summary>
 
-Yes, but with a known limitation: there's no cross-instance coordination (lock file is deferred to phase 3). Multiple instances may select the same key. Weighted-random selection partially mitigates thundering herd, but hard coordination is not yet implemented.
+Yes. Phase 3 adds cross-instance coordination via per-key file locks (`O_EXCL` at `~/.commandcode/.key-locks/`). When an instance selects a key, it acquires that key's lock; a second instance selecting the same key sees the lock and picks another unlocked key instead. If every key is locked, the instance waits on the lock that expires soonest (no deadlock). Locks auto-release after `rotation.lockTimeoutMs` (default 5min) and are refreshed every ~100s while a stream is active, so a long stream won't lose its lock. If an instance crashes, its lock clears on timeout.
+</details>
+
+<details>
+<summary><b>What happens when two instances pick the same key?</b></summary>
+
+They can't — the `O_EXCL` lock prevents it. The first instance to call `open(O_CREAT|O_EXCL)` on a key's lock file wins; the second gets `EEXIST` and `selectKey()` re-selects an unlocked key. If all keys are locked by other instances, the fallback picks the key whose lock expires soonest and logs a warning. There is no busy-wait: selection is immediate, and a held lock is released when the stream completes, errors, is cancelled, or times out.
+</details>
+
+<details>
+<summary><b>How accurate is the cost estimation?</b></summary>
+
+It's a **local estimate**, not billing data. The provider captures token usage from each response's `finish` event and multiplies by the per-model pricing in `models.json` (`input × cost.input/1M + output × cost.output/1M + cache_read + cache_write`). It will NOT exactly match your Command Code invoice — pricing changes, rounding, cache-write handling, and any models missing a `cost` entry all introduce drift (missing `cache_write` is treated as $0). Use it to compare keys relatively, not as a billing record. Totals persist cumulatively in `~/.commandcode/key-state.json`.
 </details>
 
 <details>
@@ -333,8 +377,8 @@ bunx tsc --noEmit
 
 ### Test Architecture
 
-- **115 tests** (35 provider + 80 plugin), all passing
-- **Coverage ≥80%** on all modified files (key-manager 100%, model 94%, server 96%, ui-logic 99%)
+- **246 tests** (117 provider + 129 plugin), all passing
+- **Coverage ≥80%** on all modified files (key-manager 100%, lock-manager 100%, model 95%, server ≥80%, ui-logic ≥80%)
 - **Strict TDD** — tests written first (Red-Green-Refactor)
 - **Dependency injection** for determinism: `fetchFn`, `sleep`, `now`, `random` injected (Bun has no fake timers)
 - **Pure functions** extracted from TUI components for unit testing (Solid.js render is not unit-tested)
