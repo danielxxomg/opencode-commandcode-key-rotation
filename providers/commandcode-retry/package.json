@@ -1,0 +1,33 @@
+{
+  "name": "commandcode-retry",
+  "version": "0.4.0-retry.1",
+  "description": "Command Code provider for opencode with robust retry/backoff for transient network errors (local patch of commandcode-go-opencode-provider)",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.ts",
+  "types": "index.ts",
+  "exports": {
+    ".": {
+      "import": "./index.ts"
+    }
+  },
+  "files": ["index.ts", "models.json", "src/"],
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-provider",
+    "commandcode",
+    "retry"
+  ],
+  "peerDependencies": {
+    "ai": ">=6.0.0"
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14"
+  }
+}
