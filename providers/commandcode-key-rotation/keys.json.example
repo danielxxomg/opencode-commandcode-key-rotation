@@ -1,0 +1,33 @@
+{
+  "keys": [
+    {
+      "name": "personal",
+      "key": "user_test_0000aaaa",
+      "account": "myaccount"
+    },
+    {
+      "name": "work",
+      "key": "user_test_0000bbbb",
+      "account": "work-org"
+    },
+    {
+      "name": "backup",
+      "key": "user_test_0000cccc",
+      "account": "myaccount"
+    }
+  ],
+  "rotation": {
+    "strategy": "weighted-random",
+    "cooldownMs": 60000,
+    "cooldownFromRetryAfter": true,
+    "serverErrorCooldownMs": 10000,
+    "scoreDecayPerHour": 1,
+    "maxSuccessBonus": 50
+  },
+  "notifications": {
+    "onRotate": true,
+    "onCooldown": true,
+    "onRecovery": true,
+    "onPermanentDeath": true
+  }
+}
