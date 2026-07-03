@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Lockfiles (tracked separately if needed; exclude by default to avoid noise)
+*.lock
+bun.lock
+package-lock.json
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Secrets — NEVER commit
+.env
+.env.*
+*.key
+*.pem
+keys.json
+auth.json
+
+# Logs
+*.log

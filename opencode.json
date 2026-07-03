@@ -1,0 +1,32 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "discord-py-self": {
+      "enabled": false
+    },
+    "nylas-dev": {
+      "enabled": false
+    },
+    "nylas-general": {
+      "enabled": false
+    },
+    "playwright": {
+      "enabled": false
+    },
+    "reactive-resume": {
+      "enabled": false
+    },
+    "scrapling": {
+      "enabled": false
+    },
+    "supabase": {
+      "enabled": false
+    },
+    "telegram": {
+      "enabled": false
+    },
+    "vercel": {
+      "enabled": false
+    }
+  }
+}

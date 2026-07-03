@@ -1,0 +1,23 @@
+# Gentleman Guardian Angel Configuration
+# opencode-commandcode-key-rotation — Command Code API Key Rotation Plugin
+
+# AI Provider
+PROVIDER="opencode:opencode-go/mimo-v2.5-pro"
+
+# File patterns — TypeScript project (Bun/ESM)
+FILE_PATTERNS="*.ts,*.tsx,*.json"
+
+# Exclude patterns — skip node_modules, lockfiles, build output
+EXCLUDE_PATTERNS="node_modules/*,*.lock,bun.lock,package-lock.json,dist/*,build/*"
+
+# Rules file
+RULES_FILE="AGENTS.md"
+
+# Strict mode — fail on ambiguous responses
+STRICT_MODE="true"
+
+# Timeout
+TIMEOUT="800"
+
+# PR base branch
+PR_BASE_BRANCH="main"

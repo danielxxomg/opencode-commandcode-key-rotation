@@ -1,0 +1,64 @@
+schema: spec-driven
+
+context: |
+  Tech stack: TypeScript (ESM), Bun >=1.0.0, no build step (direct .ts loading)
+  Architecture: Hybrid — provider-level key rotation (commandcode-retry) + TUI plugin (commandcode-key-rotation)
+  Testing: bun test (built-in, zero-config), no existing test scripts
+  Style: TypeScript strict, ESM imports with .js extensions, peerDep on ai SDK >=6.0.0
+  Code location: ~/.config/opencode/providers/commandcode-retry/ (modify), ~/.config/opencode/providers/commandcode-key-rotation/ (create)
+
+rules:
+  proposal:
+    - Include rollback plan for provider modifications
+    - Document which files in commandcode-retry are modified vs created
+  specs:
+    - Use Given/When/Then for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+    - Cover both main-session and sub-agent key rotation scenarios
+  design:
+    - Include sequence diagrams for key rotation flow
+    - Document KeyManager health scoring algorithm
+    - Document interception points with code evidence
+  tasks:
+    - Group by layer: provider modification, plugin server, plugin TUI
+    - Keep tasks completable in one session
+    - Provider modification is critical path (sub-agent continuity depends on it)
+  apply:
+    - Follow existing code patterns in commandcode-retry (error classification, retry schedule)
+    - Preserve backward compatibility (single apiKey option must still work)
+    tdd: true
+    test_command: "bun test"
+  verify:
+    test_command: "bun test"
+    build_command: ""
+    coverage_threshold: 80
+  archive:
+    - Warn before merging destructive deltas
+    - Verify provider still loads with single-key config after archive
+
+testing:
+  strict_tdd: true
+  runner: bun test
+  layers:
+    unit:
+      available: true
+      tool: bun test
+    integration:
+      available: false
+      tool: mock fetch + ai SDK types
+    e2e:
+      available: false
+      tool: "-"
+  coverage:
+    available: false
+    command: "bun test --coverage"
+  quality:
+    linter:
+      available: false
+      command: "-"
+    type_checker:
+      available: true
+      command: "bunx tsc --noEmit"
+    formatter:
+      available: false
+      command: "-"
