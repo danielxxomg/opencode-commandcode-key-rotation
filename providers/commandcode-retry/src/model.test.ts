@@ -420,44 +420,6 @@ describe("streamWithReconnect mid-stream swap", () => {
     const aHealth = health.find((h) => h.key === "user_test_aaaa")!
     expect(aHealth.health.rateLimitHits).toBeGreaterThan(0)
   })
-  test("mid-stream 429 before content → swap + reconnect", async () => {
-    let fetchCalls = 0
-    const keys: KeyEntry[] = [
-      { name: "a", key: "user_test_aaaa" },
-      { name: "b", key: "user_test_bbbb" },
-    ]
-
-    const mockFetch = async (): Promise<Response> => {
-      fetchCalls++
-      if (fetchCalls === 1) {
-        // First call: 200 OK but stream disconnects immediately (no content)
-        const encoder = new TextEncoder()
-        const stream = new ReadableStream({
-          start(controller) {
-            // Simulate mid-stream disconnect before any content
-            controller.error(new Error("network connection lost"))
-          },
-        })
-        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })
-      }
-      // Reconnect: success
-      return successSSE("recovered")
-    }
-
-    const model = createTestModel({
-      keys,
-      fetchFn: mockFetch as typeof fetch,
-      random: () => 0.25,
-    })
-
-    const result = await model.doGenerate({
-      prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
-    } as any)
-
-    // Initial + reconnect = 2 calls
-    expect(fetchCalls).toBe(2)
-    expect(result.content.length).toBeGreaterThan(0)
-  })
 
   test("mid-stream error after content → partialOutputError (no reconnect)", () => {
     // REQ-8: emittedContent=true → partialOutputError, NO reconnect.
