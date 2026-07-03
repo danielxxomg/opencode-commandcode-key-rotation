@@ -20,6 +20,11 @@ import {
   decideConfigWarning,
   isNotificationDismissed,
   dismissNotification,
+  formatCost,
+  formatTokens,
+  formatModelBreakdown,
+  formatLockOwner,
+  formatLockCount,
 } from "./ui-logic.js"
 
 import type { KeyState, NotificationsConfig } from "./server.js"
@@ -584,5 +589,385 @@ describe("decideToast with dismissed notifications", () => {
     // No dismissed param — backward compatible
     const result = decideToast("rotate", {}, state)
     expect(result.show).toBe(true)
+  })
+})
+
+// ─── L4-T4: shouldShowToast + decideToast — lockRelease (Phase 3) ───────────
+
+describe("shouldShowToast — lock-release (Phase 3)", () => {
+  const enabled = {
+    onRotate: true,
+    onCooldown: true,
+    onRecovery: true,
+    onPermanentDeath: true,
+    onLockRelease: true,
+  }
+  const disabled = { ...enabled, onLockRelease: false }
+
+  test("returns true for lock-release when onLockRelease enabled", () => {
+    expect(shouldShowToast("lock-release", enabled)).toBe(true)
+  })
+
+  test("returns false for lock-release when onLockRelease disabled (config gate)", () => {
+    expect(shouldShowToast("lock-release", disabled)).toBe(false)
+  })
+})
+
+describe("decideToast — lockRelease (Phase 3)", () => {
+  const stateWith = (onLockRelease: boolean): KeyState => ({
+    activeKey: "personal",
+    keys: [{ name: "personal", health: "healthy", score: 100 }],
+    notifications: {
+      onRotate: true,
+      onCooldown: true,
+      onRecovery: true,
+      onPermanentDeath: true,
+      onLockRelease,
+    },
+  })
+
+  test("lockRelease with onLockRelease=true → show=true, info variant, '🔓 Key ... lock released'", () => {
+    const result = decideToast("lockRelease", { keyName: "work" }, stateWith(true))
+    expect(result.show).toBe(true)
+    expect(result.variant).toBe("info")
+    expect(result.title).toBe("Lock Released")
+    expect(result.message).toBe("🔓 Key 'work' lock released")
+  })
+
+  test("lockRelease with onLockRelease=false → show=false (config respected)", () => {
+    const result = decideToast("lockRelease", { keyName: "work" }, stateWith(false))
+    expect(result.show).toBe(false)
+  })
+
+  test("lockRelease message uses key NAME only — no raw key material", () => {
+    const result = decideToast("lockRelease", { keyName: "personal" }, stateWith(true))
+    expect(result.message).not.toMatch(/user_[a-zA-Z0-9]{8,}/)
+    expect(result.message).toContain("personal")
+  })
+
+  test("lockRelease falls back to DEFAULT_NOTIFICATIONS (onLockRelease=true) when undefined", () => {
+    const state: KeyState = {
+      activeKey: "personal",
+      keys: [{ name: "personal", health: "healthy", score: 100 }],
+    }
+    const result = decideToast("lockRelease", { keyName: "work" }, state)
+    expect(result.show).toBe(true)
+  })
+})
+
+// ─── L4-T1: Phase 3 pure formatters ─────────────────────────────────────────
+
+describe("formatCost — USD → '$X.XX'", () => {
+  test("0.42 → '$0.42'", () => {
+    expect(formatCost(0.42)).toBe("$0.42")
+  })
+
+  test("0 → '$0.00'", () => {
+    expect(formatCost(0)).toBe("$0.00")
+  })
+
+  test("rounds to 2 decimals (0.346 → '$0.35', 12.3456 → '$12.35')", () => {
+    expect(formatCost(0.346)).toBe("$0.35")
+    expect(formatCost(12.3456)).toBe("$12.35")
+  })
+
+  test("large value keeps dollars (1.5 → '$1.50', 100 → '$100.00')", () => {
+    expect(formatCost(1.5)).toBe("$1.50")
+    expect(formatCost(100)).toBe("$100.00")
+  })
+
+  test("undefined → '$0.00' (no cost data → clean zero)", () => {
+    expect(formatCost(undefined)).toBe("$0.00")
+  })
+})
+
+describe("formatTokens — compact 'in/out' with k suffix", () => {
+  test("1200/800 → '1.2k/0.8k'", () => {
+    expect(formatTokens(1200, 800)).toBe("1.2k/0.8k")
+  })
+
+  test("0/0 → '0/0'", () => {
+    expect(formatTokens(0, 0)).toBe("0/0")
+  })
+
+  test("hundreds shown in k (500/200 → '0.5k/0.2k')", () => {
+    expect(formatTokens(500, 200)).toBe("0.5k/0.2k")
+  })
+
+  test("values under 100 shown as-is (50/30 → '50/30')", () => {
+    expect(formatTokens(50, 30)).toBe("50/30")
+  })
+
+  test("exact 1000 → '1k' (trailing .0 stripped)", () => {
+    expect(formatTokens(1000, 0)).toBe("1k/0")
+  })
+
+  test("1500/1000 → '1.5k/1k'", () => {
+    expect(formatTokens(1500, 1000)).toBe("1.5k/1k")
+  })
+
+  test("undefined → '0/0'", () => {
+    expect(formatTokens(undefined, undefined)).toBe("0/0")
+  })
+})
+
+// ─── L4-T3: formatKeyStatus extended with 💰 cost + 🔒 lock ─────────────────
+
+describe("formatKeyStatus — Phase 3 cost + lock indicators", () => {
+  test("shows 💰 total cost + 🔒 lock count when cost + lock data present", () => {
+    const state: KeyState = {
+      activeKey: "personal",
+      keys: [
+        { name: "personal", health: "healthy", score: 100, totalCostUSD: 0.3, locked: true },
+        { name: "work", health: "healthy", score: 90, totalCostUSD: 0.12 },
+      ],
+    }
+    const result = formatKeyStatus(state)
+    // Total cost = 0.30 + 0.12 = 0.42
+    expect(result).toContain("💰 $0.42")
+    // 1 key locked
+    expect(result).toContain("🔒 1 locked")
+  })
+
+  test("$0.00 cost still shows 💰 $0.00", () => {
+    const state: KeyState = {
+      activeKey: "personal",
+      keys: [{ name: "personal", health: "healthy", score: 100, totalCostUSD: 0 }],
+    }
+    const result = formatKeyStatus(state)
+    expect(result).toContain("💰 $0.00")
+  })
+
+  test("0 locked → no 🔒 indicator (clean)", () => {
+    const state: KeyState = {
+      activeKey: "personal",
+      keys: [
+        { name: "personal", health: "healthy", score: 100, totalCostUSD: 0.5, locked: false },
+      ],
+    }
+    const result = formatKeyStatus(state)
+    expect(result).toContain("💰 $0.50")
+    expect(result).not.toContain("🔒")
+  })
+
+  test("no phase-3 data → no 💰/🔒 indicators (backward compat with phase 1+2 state)", () => {
+    const state: KeyState = {
+      activeKey: "personal",
+      keys: [
+        { name: "personal", health: "healthy", score: 100, account: "acc1" },
+        { name: "work", health: "rate-limited", score: 80 },
+      ],
+    }
+    const result = formatKeyStatus(state)
+    expect(result).not.toContain("💰")
+    expect(result).not.toContain("🔒")
+    // Phase 1+2 content still present
+    expect(result).toContain("2 keys")
+    expect(result).toContain("1 healthy")
+  })
+})
+
+// ─── L4-T4: formatKeyStatusTable — Phase 3 columns + summary + breakdown ────
+
+describe("formatKeyStatusTable — Phase 3 columns + summary + model breakdown", () => {
+  test("with cost + lock data → new columns, per-key cost/tokens/lock-owner, summary, model breakdown", () => {
+    const state: KeyState = {
+      activeKey: "personal",
+      keys: [
+        {
+          name: "personal",
+          health: "healthy",
+          score: 100,
+          account: "acc1",
+          totalInputTokens: 1000,
+          totalOutputTokens: 200,
+          totalCostUSD: 0.3,
+          locked: true,
+          lockOwner: "a8523b91-1234-5678-abcd-ef0123456789",
+          modelUsage: {
+            "claude-sonnet-4-6": { inputTokens: 1000, outputTokens: 200, costUSD: 0.3 },
+          },
+        },
+        {
+          name: "work",
+          health: "healthy",
+          score: 90,
+          account: "acc2",
+          totalInputTokens: 800,
+          totalOutputTokens: 0,
+          totalCostUSD: 0.12,
+          locked: false,
+          lockOwner: null,
+          modelUsage: {
+            "gpt-5.4": { inputTokens: 800, outputTokens: 0, costUSD: 0.12 },
+          },
+        },
+      ],
+    }
+
+    const result = formatKeyStatusTable(state)
+
+    // New column headers present
+    expect(result).toContain("Est. Cost")
+    expect(result).toContain("Lock Owner")
+    expect(result).toContain("Tokens")
+
+    // Per-key values: costs
+    expect(result).toContain("$0.30")
+    expect(result).toContain("$0.12")
+    // Per-key tokens (in/out): personal 1000/200 → "1k/0.2k"; work 800/0 → "0.8k/0"
+    expect(result).toContain("1k/0.2k")
+    expect(result).toContain("0.8k/0")
+    // Lock owner truncated to 8 chars for locked key; em dash for unlocked
+    expect(result).toContain("a8523b91")
+    expect(result).toContain("—")
+
+    // Summary section
+    expect(result).toContain("Summary")
+    expect(result).toContain("Total est. cost")
+    expect(result).toContain("$0.42") // 0.30 + 0.12
+    expect(result).toContain("Top model")
+
+    // Model breakdown section
+    expect(result).toContain("Model breakdown")
+    expect(result).toContain("claude-sonnet-4-6: $0.30")
+    expect(result).toContain("gpt-5.4: $0.12")
+  })
+
+  test("uses 'est. cost' label (NOT 'billed'/'charged')", () => {
+    const state: KeyState = {
+      activeKey: "personal",
+      keys: [
+        {
+          name: "personal",
+          health: "healthy",
+          score: 100,
+          totalCostUSD: 0.3,
+          totalInputTokens: 100,
+          totalOutputTokens: 50,
+        },
+      ],
+    }
+    const result = formatKeyStatusTable(state)
+    expect(result).toContain("Est. Cost")
+    expect(result.toLowerCase()).not.toContain("billed")
+    expect(result.toLowerCase()).not.toContain("charged")
+  })
+
+  test("no phase-3 data → no new columns, no summary, no breakdown (backward compat)", () => {
+    const state: KeyState = {
+      activeKey: "personal",
+      keys: [
+        { name: "personal", health: "healthy", score: 100, account: "acc1" },
+        { name: "work", health: "rate-limited", score: 80, cooldownExpiry: Date.now() + 60000 },
+      ],
+    }
+    const result = formatKeyStatusTable(state)
+
+    // Phase 1+2 content still present
+    expect(result).toContain("Name")
+    expect(result).toContain("Account")
+    expect(result).toContain("personal")
+    expect(result).toContain("work")
+    expect(result).toContain("100")
+    expect(result).toContain("80")
+
+    // No phase-3 additions
+    expect(result).not.toContain("Summary")
+    expect(result).not.toContain("Model breakdown")
+    expect(result).not.toContain("Est. Cost")
+    expect(result).not.toContain("Total est. cost")
+  })
+
+  test("summary aggregates tokens + cost across all keys", () => {
+    const state: KeyState = {
+      activeKey: "personal",
+      keys: [
+        {
+          name: "personal",
+          health: "healthy",
+          score: 100,
+          totalInputTokens: 1000,
+          totalOutputTokens: 200,
+          totalCostUSD: 0.3,
+          modelUsage: { "claude-sonnet-4-6": { inputTokens: 1000, outputTokens: 200, costUSD: 0.3 } },
+        },
+        {
+          name: "work",
+          health: "healthy",
+          score: 90,
+          totalInputTokens: 800,
+          totalOutputTokens: 100,
+          totalCostUSD: 0.12,
+          modelUsage: { "gpt-5.4": { inputTokens: 800, outputTokens: 100, costUSD: 0.12 } },
+        },
+      ],
+    }
+    const result = formatKeyStatusTable(state)
+
+    // Total cost 0.42 + total tokens 1.8k in / 0.3k out
+    expect(result).toContain("$0.42")
+    expect(result).toContain("1.8k/0.3k")
+  })
+})
+
+describe("formatModelBreakdown — multi-line per-model cost + tokens", () => {
+  test("two models → multi-line 'id: $cost (Xk tok)'", () => {
+    const usage = {
+      "claude-sonnet-4-6": { inputTokens: 1000, outputTokens: 200, costUSD: 0.3 },
+      "gpt-5.4": { inputTokens: 800, outputTokens: 0, costUSD: 0.12 },
+    }
+    const result = formatModelBreakdown(usage)
+    const lines = result.split("\n")
+    expect(lines.length).toBe(2)
+    expect(lines[0]).toBe("claude-sonnet-4-6: $0.30 (1.2k tok)")
+    expect(lines[1]).toBe("gpt-5.4: $0.12 (0.8k tok)")
+  })
+
+  test("single model → one line", () => {
+    const result = formatModelBreakdown({
+      "claude-sonnet-4-6": { inputTokens: 500, outputTokens: 500, costUSD: 0.05 },
+    })
+    expect(result).toBe("claude-sonnet-4-6: $0.05 (1k tok)")
+  })
+
+  test("empty usage → empty string", () => {
+    expect(formatModelBreakdown({})).toBe("")
+  })
+})
+
+describe("formatLockOwner — truncate UUID to first 8 chars", () => {
+  test("null → '—'", () => {
+    expect(formatLockOwner(null)).toBe("—")
+  })
+
+  test("undefined → '—'", () => {
+    expect(formatLockOwner(undefined)).toBe("—")
+  })
+
+  test("UUID truncated to first 8 chars (a8523b91-... → 'a8523b91')", () => {
+    expect(formatLockOwner("a8523b91-1234-5678-abcd-ef0123456789")).toBe("a8523b91")
+  })
+
+  test("8-char id returned as-is ('inst-abc' → 'inst-abc')", () => {
+    expect(formatLockOwner("inst-abc")).toBe("inst-abc")
+  })
+
+  test("short id (< 8 chars) returned as-is", () => {
+    expect(formatLockOwner("short")).toBe("short")
+  })
+})
+
+describe("formatLockCount — '🔒 N locked' or empty", () => {
+  test("0 → '' (clean, no indicator)", () => {
+    expect(formatLockCount(0)).toBe("")
+  })
+
+  test("1 → '🔒 1 locked'", () => {
+    expect(formatLockCount(1)).toBe("🔒 1 locked")
+  })
+
+  test("2 → '🔒 2 locked'", () => {
+    expect(formatLockCount(2)).toBe("🔒 2 locked")
   })
 })

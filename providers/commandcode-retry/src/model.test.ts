@@ -2,7 +2,7 @@ import { describe, test, expect } from "bun:test"
 import { createCommandCode } from "../index.js"
 import { CommandCodeLanguageModel, shouldRetry, partialOutputError } from "./model.js"
 import { KeyManager } from "./key-manager.js"
-import type { KeyEntry } from "./key-manager.js"
+import type { KeyEntry, ModelCost } from "./key-manager.js"
 
 describe("createCommandCode factory", () => {
   test("single apiKey → legacy mode, no key rotation, no KeyManager", async () => {
@@ -68,6 +68,10 @@ describe("createCommandCode factory", () => {
 /**
  * Helper: create a CommandCodeLanguageModel with injected dependencies.
  * This lets us test fetchWithRetry behavior without hitting the real API.
+ *
+ * Phase 3 options (lockManager, lockTimeoutMs, costMap, setInterval,
+ * clearInterval, keyManager override) are all optional and conditionally
+ * spread so the model behaves identically to phase 1+2 when omitted.
  */
 function createTestModel(opts: {
   keys: KeyEntry[]
@@ -75,12 +79,26 @@ function createTestModel(opts: {
   random?: () => number
   now?: () => number
   dev?: boolean
+  // Phase 3 extensions (all optional):
+  keyManager?: KeyManager // override (e.g. for selectKey spies)
+  lockManager?: {
+    acquireLock(name: string): boolean
+    releaseLock(name: string): void
+    refreshLock(name: string): boolean
+  }
+  lockTimeoutMs?: number
+  costMap?: Record<string, ModelCost>
+  setInterval?: (handler: () => void, timeout?: number) => unknown
+  clearInterval?: (handle: unknown) => void
 }) {
-  const keyManager = new KeyManager({
-    keys: opts.keys,
-    random: opts.random ?? (() => 0.5),
-    now: opts.now ?? (() => 1000),
-  })
+  const keyManager =
+    opts.keyManager ??
+    new KeyManager({
+      keys: opts.keys,
+      random: opts.random ?? (() => 0.5),
+      now: opts.now ?? (() => 1000),
+      ...(opts.costMap ? { costMap: opts.costMap } : {}),
+    })
   return new CommandCodeLanguageModel("test-model", {
     apiKey: opts.keys[0]!.key,
     keyManager,
@@ -89,6 +107,10 @@ function createTestModel(opts: {
     now: opts.now ?? (() => 1000),
     random: opts.random ?? (() => 0.5),
     dev: opts.dev,
+    ...(opts.lockManager ? { lockManager: opts.lockManager } : {}),
+    ...(opts.lockTimeoutMs ? { lockTimeoutMs: opts.lockTimeoutMs } : {}),
+    ...(opts.setInterval ? { setInterval: opts.setInterval } : {}),
+    ...(opts.clearInterval ? { clearInterval: opts.clearInterval } : {}),
   })
 }
 
@@ -545,5 +567,774 @@ describe("dev-mode error logging (REQ-9)", () => {
     // Should NOT have CC-Dev logs
     const devLog = loggedLines.find((l) => l.includes("[CC-Dev]"))
     expect(devLog).toBeUndefined()
+  })
+})
+
+// ============================================================================
+// Phase 3 — PR3: Provider refactor (L2-T1..L2-T8)
+// fetchWithRetry sole selection authority, lock lifecycle, usage stream wrapper.
+// All gated behind optional deps (lockManager / costMap) for backward compat.
+// ============================================================================
+
+describe("fetchWithRetry sole selection authority (L2-T1)", () => {
+  test("selectKey called exactly once per successful fetch — no double selection", async () => {
+    // Bug being fixed: doStream's fetchOpts() (model.ts line 579) called
+    // km.selectKey() AND fetchWithRetry (line 315) called it again per attempt
+    // → 2 selections for 1 fetch. After refactor fetchOpts is a pure builder
+    // (takes a key param, no selection); fetchWithRetry is the SOLE authority.
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const keyManager = new KeyManager({ keys, random: () => 0.25, now: () => 1000 })
+    let selectCalls = 0
+    const origSelect = keyManager.selectKey.bind(keyManager)
+    keyManager.selectKey = () => {
+      selectCalls++
+      return origSelect()
+    }
+
+    const mockFetch = async (): Promise<Response> => successSSE("ok")
+
+    const model = new CommandCodeLanguageModel("test-model", {
+      apiKey: keys[0]!.key,
+      keyManager,
+      fetchFn: mockFetch as typeof fetch,
+      sleep: () => Promise.resolve(),
+      random: () => 0.25,
+      now: () => 1000,
+    })
+
+    await model.doGenerate({
+      prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+    } as any)
+
+    // Sole authority: exactly 1 selection for 1 successful fetch.
+    // Before fix: 2 (fetchOpts + fetchWithRetry). After fix: 1.
+    expect(selectCalls).toBe(1)
+  })
+
+  test("keyUsed is the key actually selected — attributed via reportSuccess", async () => {
+    // fetchWithRetry returns { response, keyUsed, releaseLock }. keyUsed is the
+    // key string that served the request. Observed behaviorally: the request's
+    // Authorization header uses keyUsed, and reportSuccess is called for it.
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const keyManager = new KeyManager({ keys, random: () => 0.25, now: () => 1000 })
+
+    let usedAuthHeader: string | undefined
+    const mockFetch = async (_url: string, init: RequestInit): Promise<Response> => {
+      usedAuthHeader = (init.headers as Record<string, string>).Authorization
+      return successSSE("ok")
+    }
+
+    const model = new CommandCodeLanguageModel("test-model", {
+      apiKey: keys[0]!.key,
+      keyManager,
+      fetchFn: mockFetch as typeof fetch,
+      sleep: () => Promise.resolve(),
+      random: () => 0.25,
+      now: () => 1000,
+    })
+
+    await model.doGenerate({
+      prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+    } as any)
+
+    // keyUsed = A (random 0.25 selects A). Request header reflects keyUsed.
+    expect(usedAuthHeader).toBe("Bearer user_test_aaaa")
+    // reportSuccess attributed to the used key only.
+    const health = keyManager.getHealthSnapshot()
+    const a = health.find((h) => h.key === "user_test_aaaa")!
+    const b = health.find((h) => h.key === "user_test_bbbb")!
+    expect(a.health.successCount).toBe(1)
+    expect(b.health.successCount).toBe(0)
+  })
+})
+
+/**
+ * Fake lock coordinator that records acquire/release/refresh calls by key NAME.
+ * The real LockManager satisfies the same surface structurally.
+ */
+function makeFakeLockManager() {
+  const acquireCalls: string[] = []
+  const releaseCalls: string[] = []
+  const refreshCalls: string[] = []
+  const lock = {
+    acquireLock: (name: string) => {
+      acquireCalls.push(name)
+      return true
+    },
+    releaseLock: (name: string) => {
+      releaseCalls.push(name)
+    },
+    refreshLock: (name: string) => {
+      refreshCalls.push(name)
+      return true
+    },
+  }
+  return { lock, acquireCalls, releaseCalls, refreshCalls }
+}
+
+const PROMPT = [{ role: "user", content: [{ type: "text", text: "hi" }] }]
+
+describe("lock lifecycle (L2-T3)", () => {
+  test("lock acquired on select, released after doGenerate response consumed (stream close)", async () => {
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const lock = makeFakeLockManager()
+    const mockFetch = async (): Promise<Response> => successSSE("ok")
+    const model = createTestModel({
+      keys,
+      fetchFn: mockFetch as typeof fetch,
+      random: () => 0.25, // selects A
+      lockManager: lock.lock,
+      setInterval: () => "h1",
+      clearInterval: () => {},
+    })
+
+    await model.doGenerate({ prompt: PROMPT } as any)
+
+    // Acquired with the selected key's NAME ("a"), released when the stream
+    // closed (doGenerate consumed the full response → done → close).
+    expect(lock.acquireCalls).toEqual(["a"])
+    expect(lock.releaseCalls).toEqual(["a"])
+  })
+
+  test("lock released when fetchWithRetry exhausts retries (fatal — no stream created)", async () => {
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const lock = makeFakeLockManager()
+    const mockFetch = async (): Promise<Response> =>
+      new Response('{"error":{"message":"internal server error"}}', { status: 500 })
+    const model = createTestModel({
+      keys,
+      fetchFn: mockFetch as typeof fetch,
+      lockManager: lock.lock,
+      setInterval: () => "h1",
+      clearInterval: () => {},
+    })
+
+    await expect(model.doGenerate({ prompt: PROMPT } as any)).rejects.toThrow(/500|server error|internal/i)
+
+    // Lock was acquired across attempts and released on the fatal throw
+    // (no stream is created to hold the lock, so fetchWithRetry must release).
+    expect(lock.acquireCalls.length).toBeGreaterThan(0)
+    expect(lock.releaseCalls.length).toBeGreaterThan(0)
+  })
+
+  test("lock released on stream cancel (consumer cancels the doStream stream)", async () => {
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const lock = makeFakeLockManager()
+    // A stream that emits one delta then stays open — only cancel terminates it.
+    const mockFetch = async (): Promise<Response> => {
+      const encoder = new TextEncoder()
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode('data: {"type":"text-delta","id":"t1","text":"hi"}\n\n'),
+          )
+          // intentionally do NOT close — keep the stream open
+        },
+      })
+      return new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      })
+    }
+    const model = createTestModel({
+      keys,
+      fetchFn: mockFetch as typeof fetch,
+      random: () => 0.25,
+      lockManager: lock.lock,
+      setInterval: () => "h1",
+      clearInterval: () => {},
+    })
+
+    const { stream } = await model.doStream({ prompt: PROMPT } as any)
+    await stream.cancel() // consumer cancels without fully reading
+
+    expect(lock.acquireCalls).toEqual(["a"])
+    expect(lock.releaseCalls).toEqual(["a"])
+  })
+
+  test("refresh timer starts on acquire (interval = lockTimeoutMs/3) and is cleared on release", async () => {
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const lock = makeFakeLockManager()
+    const intervals: Array<{ handler: () => void; ms: number }> = []
+    const cleared: unknown[] = []
+    const mockFetch = async (): Promise<Response> => successSSE("ok")
+    const model = createTestModel({
+      keys,
+      fetchFn: mockFetch as typeof fetch,
+      random: () => 0.25,
+      lockManager: lock.lock,
+      lockTimeoutMs: 300_000,
+      setInterval: (h, ms) => {
+        intervals.push({ handler: h, ms: ms ?? 0 })
+        return "h1"
+      },
+      clearInterval: (handle) => {
+        cleared.push(handle)
+      },
+    })
+
+    await model.doGenerate({ prompt: PROMPT } as any)
+
+    // One refresh timer started on acquire, with interval = lockTimeoutMs/3.
+    expect(intervals).toHaveLength(1)
+    expect(intervals[0]!.ms).toBe(100_000)
+    // Timer cleared when the lock was released (stream close).
+    expect(cleared).toEqual(["h1"])
+  })
+
+  test("no lockManager → no lock logic (request succeeds without any lock ops)", async () => {
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const mockFetch = async (): Promise<Response> => successSSE("ok")
+    const model = createTestModel({
+      keys,
+      fetchFn: mockFetch as typeof fetch,
+      random: () => 0.25,
+      // NO lockManager — lock logic MUST be skipped entirely (no crash from
+      // calling acquireLock on an undefined lockManager).
+    })
+
+    const result = await model.doGenerate({ prompt: PROMPT } as any)
+    expect(result.content.length).toBeGreaterThan(0)
+  })
+})
+
+describe("usage capture via stream wrapper (L2-T5)", () => {
+  test("finish event → reportUsage(keyUsed, modelId, usage) attributes tokens + cost to the used key", async () => {
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const costMap: Record<string, ModelCost> = {
+      "test-model": { input: 1, output: 5, cache_read: 0.1 },
+    }
+    const keyManager = new KeyManager({
+      keys,
+      random: () => 0.25,
+      now: () => 1000,
+      costMap,
+    })
+    const mockFetch = async (): Promise<Response> => successSSE("ok")
+    const model = createTestModel({
+      keys,
+      fetchFn: mockFetch as typeof fetch,
+      random: () => 0.25,
+      keyManager,
+    })
+
+    await model.doGenerate({ prompt: PROMPT } as any)
+
+    // successSSE's finish-step carries usage {inputTokens: 10, outputTokens: 1}.
+    // The wrapper intercepts finish → reportUsage(A, "test-model", usage).
+    const health = keyManager.getHealthSnapshot()
+    const a = health.find((h) => h.key === "user_test_aaaa")!
+    const b = health.find((h) => h.key === "user_test_bbbb")!
+    expect(a.health.totalInputTokens).toBe(10)
+    expect(a.health.totalOutputTokens).toBe(1)
+    expect(a.health.totalCostUSD).toBeGreaterThan(0)
+    // Unused key B gets no usage attribution.
+    expect(b.health.totalInputTokens).toBe(0)
+    expect(b.health.totalCostUSD).toBe(0)
+  })
+
+  test("event order preserved — all events forwarded unchanged (finish after text-delta)", async () => {
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const mockFetch = async (): Promise<Response> => successSSE("ok")
+    const model = createTestModel({
+      keys,
+      fetchFn: mockFetch as typeof fetch,
+      random: () => 0.25,
+    })
+
+    const { stream } = await model.doStream({ prompt: PROMPT } as any)
+    const reader = stream.getReader()
+    const types: string[] = []
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      types.push(value.type)
+    }
+
+    // successSSE emits text-delta then finish-step(→finish). The wrapper must
+    // forward both, in order, without dropping or reordering.
+    expect(types).toContain("text-delta")
+    expect(types).toContain("finish")
+    expect(types.indexOf("text-delta")).toBeLessThan(types.indexOf("finish"))
+  })
+
+  test("reportUsage error isolated — if reportUsage throws, the stream still completes", async () => {
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const costMap: Record<string, ModelCost> = {
+      "test-model": { input: 1, output: 5, cache_read: 0.1 },
+    }
+    const keyManager = new KeyManager({
+      keys,
+      random: () => 0.25,
+      now: () => 1000,
+      costMap,
+    })
+    // Spy: record that reportUsage was called, then throw (simulates a bad
+    // costMap entry / div-by-zero). The wrapper MUST isolate this so the
+    // stream never breaks.
+    let reportUsageCalls = 0
+    keyManager.reportUsage = () => {
+      reportUsageCalls++
+      throw new Error("boom from reportUsage")
+    }
+
+    const mockFetch = async (): Promise<Response> => successSSE("ok")
+    const model = createTestModel({
+      keys,
+      fetchFn: mockFetch as typeof fetch,
+      random: () => 0.25,
+      keyManager,
+    })
+
+    const result = await model.doGenerate({ prompt: PROMPT } as any)
+
+    // reportUsage WAS invoked by the wrapper (proves the interception ran)…
+    expect(reportUsageCalls).toBe(1)
+    // …and the stream completed with content DESPITE the throw (error isolation).
+    expect(result.content.length).toBeGreaterThan(0)
+  })
+
+  test("no KeyManager → no wrapper (legacy single-key mode, no usage tracking)", async () => {
+    // Legacy mode: single apiKey, no KeyManager. The wrapper must be skipped
+    // entirely — no reportUsage call on an undefined keyManager, identical to
+    // phase 1+2.
+    const mockFetch = async (): Promise<Response> => successSSE("ok")
+    const model = new CommandCodeLanguageModel("test-model", {
+      apiKey: "user_test_legacy",
+      fetchFn: mockFetch as typeof fetch,
+      sleep: () => Promise.resolve(),
+    })
+
+    const result = await model.doGenerate({ prompt: PROMPT } as any)
+    expect(result.content.length).toBeGreaterThan(0)
+  })
+})
+
+describe("backward compat — optional-deps gating (L2-T7)", () => {
+  test("keyManager but NO costMap → tokens tracked, cost stays 0 (no cost tracking)", async () => {
+    // The wrapper still applies (keyManager present) so token counts are
+    // accumulated for display, but without a costMap no USD cost is computed
+    // and no cost-penalty is applied to the score (PR2 reportUsage behavior).
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const keyManager = new KeyManager({ keys, random: () => 0.25, now: () => 1000 })
+    const mockFetch = async (): Promise<Response> => successSSE("ok")
+    const model = createTestModel({
+      keys,
+      fetchFn: mockFetch as typeof fetch,
+      random: () => 0.25,
+      keyManager,
+      // NO costMap, NO lockManager
+    })
+
+    await model.doGenerate({ prompt: PROMPT } as any)
+
+    const a = keyManager.getHealthSnapshot().find((h) => h.key === "user_test_aaaa")!
+    expect(a.health.totalInputTokens).toBe(10) // tokens tracked
+    expect(a.health.totalCostUSD).toBe(0) // no costMap → no cost
+  })
+
+  test("keyManager + costMap but NO lockManager → cost tracked, no lock logic", async () => {
+    // Cost tracking works without a lockManager; lock acquire/release are
+    // skipped entirely (no crash from calling acquireLock on undefined).
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const costMap: Record<string, ModelCost> = {
+      "test-model": { input: 1, output: 5, cache_read: 0.1 },
+    }
+    const keyManager = new KeyManager({ keys, random: () => 0.25, now: () => 1000, costMap })
+    const mockFetch = async (): Promise<Response> => successSSE("ok")
+    const model = createTestModel({
+      keys,
+      fetchFn: mockFetch as typeof fetch,
+      random: () => 0.25,
+      keyManager,
+      // NO lockManager
+    })
+
+    const result = await model.doGenerate({ prompt: PROMPT } as any)
+    expect(result.content.length).toBeGreaterThan(0)
+
+    const a = keyManager.getHealthSnapshot().find((h) => h.key === "user_test_aaaa")!
+    expect(a.health.totalCostUSD).toBeGreaterThan(0) // cost tracked
+  })
+
+  test("legacy single-key mode (no keyManager/lockManager/costMap) → identical to phase 1+2: single fetch, no swaps", async () => {
+    let fetchCalls = 0
+    const mockFetch = async (): Promise<Response> => {
+      fetchCalls++
+      return successSSE("ok")
+    }
+    const model = new CommandCodeLanguageModel("test-model", {
+      apiKey: "user_test_legacy",
+      fetchFn: mockFetch as typeof fetch,
+      sleep: () => Promise.resolve(),
+    })
+
+    const result = await model.doGenerate({ prompt: PROMPT } as any)
+
+    expect(result.content.length).toBeGreaterThan(0)
+    // No KeyManager → no selection, no swaps, no retries on success: 1 fetch.
+    expect(fetchCalls).toBe(1)
+  })
+})
+
+// ============================================================================
+// PR3 corrective: mid-stream reconnect lock management (L2-T4)
+// Gate failure: reconnect released neither the failed key's lock nor acquired a
+// lock for the new reconnect key. These tests prove the lock lifecycle is
+// honored across a pre-content mid-stream reconnect.
+// ============================================================================
+
+describe("mid-stream reconnect lock management (L2-T4 corrective)", () => {
+  test("reconnect WITH lockManager → old key released before reconnect fetch, new key acquired, final release targets new key", async () => {
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    // Force deterministic selection: A on the initial fetch, B on reconnect.
+    const keyManager = new KeyManager({ keys, random: () => 0.25, now: () => 1000 })
+    let selectCalls = 0
+    keyManager.selectKey = () => {
+      selectCalls++
+      return selectCalls === 1
+        ? { name: "a", key: "user_test_aaaa" }
+        : { name: "b", key: "user_test_bbbb" }
+    }
+
+    // Shared event log: records lock ops AND fetch calls in order so we can
+    // assert ordering (old key released BEFORE the reconnect fetch).
+    const events: string[] = []
+    const lock = {
+      acquireLock: (name: string) => {
+        events.push(`acquire:${name}`)
+        return true
+      },
+      releaseLock: (name: string) => {
+        events.push(`release:${name}`)
+      },
+      refreshLock: (_name: string) => true,
+    }
+
+    let fetchCalls = 0
+    const mockFetch = async (_url: string, init: RequestInit): Promise<Response> => {
+      fetchCalls++
+      const auth = (init.headers as Record<string, string>).Authorization
+      events.push(`fetch:${auth.replace("Bearer ", "")}`)
+      if (fetchCalls === 1) {
+        // 200 OK but the stream disconnects immediately (pre-content) → reconnect
+        const encoder = new TextEncoder()
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.error(new Error("network connection lost"))
+          },
+        })
+        return new Response(stream, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        })
+      }
+      return successSSE("recovered")
+    }
+
+    const model = createTestModel({
+      keys,
+      fetchFn: mockFetch as typeof fetch,
+      keyManager,
+      lockManager: lock,
+      setInterval: () => "h1",
+      clearInterval: () => {},
+    })
+
+    const result = await model.doGenerate({ prompt: PROMPT } as any)
+
+    expect(result.content.length).toBeGreaterThan(0)
+    expect(fetchCalls).toBe(2) // initial + reconnect
+
+    // Old key (a) released BEFORE the reconnect fetch (b)
+    const releaseA = events.indexOf("release:a")
+    const fetchB = events.indexOf("fetch:user_test_bbbb")
+    expect(releaseA).toBeGreaterThanOrEqual(0)
+    expect(fetchB).toBeGreaterThanOrEqual(0)
+    expect(releaseA).toBeLessThan(fetchB)
+
+    // New key (b) lock acquired
+    expect(events).toContain("acquire:b")
+
+    // Final release targets the NEW key (b), not the old (a)
+    const releases = events.filter((e) => e.startsWith("release:"))
+    expect(releases[releases.length - 1]).toBe("release:b")
+
+    // Old key released exactly once (no double-release on the terminal path)
+    expect(releases.filter((e) => e === "release:a").length).toBe(1)
+  })
+
+  test("reconnect WITHOUT lockManager → no lock logic, backward compatible (A→B swap still works)", async () => {
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const keyManager = new KeyManager({ keys, random: () => 0.25, now: () => 1000 })
+    let selectCalls = 0
+    keyManager.selectKey = () => {
+      selectCalls++
+      return selectCalls === 1
+        ? { name: "a", key: "user_test_aaaa" }
+        : { name: "b", key: "user_test_bbbb" }
+    }
+
+    let fetchCalls = 0
+    const usedKeys: string[] = []
+    const mockFetch = async (_url: string, init: RequestInit): Promise<Response> => {
+      fetchCalls++
+      const auth = (init.headers as Record<string, string>).Authorization
+      usedKeys.push(auth.replace("Bearer ", ""))
+      if (fetchCalls === 1) {
+        const encoder = new TextEncoder()
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.error(new Error("network connection lost"))
+          },
+        })
+        return new Response(stream, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        })
+      }
+      return successSSE("recovered")
+    }
+
+    const model = createTestModel({
+      keys,
+      fetchFn: mockFetch as typeof fetch,
+      keyManager,
+      // NO lockManager — lock logic MUST be skipped entirely (no crash)
+    })
+
+    const result = await model.doGenerate({ prompt: PROMPT } as any)
+
+    expect(result.content.length).toBeGreaterThan(0)
+    expect(fetchCalls).toBe(2)
+    // Reconnect swapped to key B (proves selectKey + fetch path still works
+    // without any lock coordination)
+    expect(usedKeys).toEqual(["user_test_aaaa", "user_test_bbbb"])
+  })
+
+  test("reconnect lock swap → onStateChange reflects new key locked then unlocked (Fix 3)", async () => {
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const lock = makeStatefulFakeLock()
+    const keyManager = new KeyManager({
+      keys, random: () => 0.25, now: () => 1000, lockManager: lock,
+    })
+    let selectCalls = 0
+    keyManager.selectKey = () => {
+      selectCalls++
+      return selectCalls === 1
+        ? { name: "a", key: "user_test_aaaa" }
+        : { name: "b", key: "user_test_bbbb" }
+    }
+    const snapshots: Array<Array<{ name: string; locked: boolean }>> = []
+    keyManager.notifyStateChange = () => {
+      // Re-read live snapshot so lock status reflects the stateful fake lock.
+      snapshots.push(keyManager.getHealthSnapshot().map((s) => ({ name: s.name, locked: s.locked })))
+    }
+
+    let fetchCalls = 0
+    const mockFetch = async (): Promise<Response> => {
+      fetchCalls++
+      if (fetchCalls === 1) {
+        const encoder = new TextEncoder()
+        const stream = new ReadableStream({
+          start(controller) { controller.error(new Error("network connection lost")) },
+        })
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })
+      }
+      return successSSE("recovered")
+    }
+    const model = createTestModel({
+      keys, fetchFn: mockFetch as typeof fetch, keyManager, lockManager: lock,
+      setInterval: () => "h1", clearInterval: () => {},
+    })
+
+    await model.doGenerate({ prompt: PROMPT } as any)
+
+    // After reconnect acquire, a snapshot shows the NEW key (b) locked.
+    const bLocked = snapshots.some((snap) => snap.find((s) => s.name === "b")?.locked === true)
+    expect(bLocked).toBe(true)
+    // After the final release, a snapshot shows b unlocked.
+    const bUnlocked = snapshots.some((snap) => snap.find((s) => s.name === "b")?.locked === false)
+    expect(bUnlocked).toBe(true)
+    // And the lock really was released.
+    expect(lock._lockedSet.has("b")).toBe(false)
+  })
+})
+
+// ─── Fix 3: lock state bridge — provider acquire/release → onStateChange ─────
+
+/**
+ * Stateful fake lock satisfying BOTH interfaces the wiring needs:
+ * - LockLifecycleCoordinator (acquireLock/releaseLock/refreshLock) for the model
+ * - KeyLockCoordinator (isLocked/getLockOwner/getActiveLocks) for the KeyManager
+ * Tracks lock state so the KeyManager's getHealthSnapshot() reads accurate lock
+ * status that reflects the model's acquire/release calls.
+ */
+function makeStatefulFakeLock(instanceId = "inst-test") {
+  const locked = new Set<string>()
+  return {
+    acquireLock: (name: string) => { locked.add(name); return true },
+    releaseLock: (name: string) => { locked.delete(name) },
+    refreshLock: (_name: string) => true,
+    isLocked: (name: string) => locked.has(name),
+    getLockOwner: (name: string) => (locked.has(name) ? instanceId : null),
+    getActiveLocks: () =>
+      [...locked].map((name) => ({
+        keyName: name, instanceId, acquiredAt: 1000, expiresAt: 9999,
+      })),
+    _lockedSet: locked,
+  }
+}
+
+describe("lock state bridge — onStateChange emitted after acquire/release (Fix 3)", () => {
+  test("after lock acquire, onStateChange receives a snapshot with the key locked", async () => {
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const lock = makeStatefulFakeLock()
+    const snapshots: Array<Array<{ name: string; locked: boolean }>> = []
+    const keyManager = new KeyManager({
+      keys,
+      random: () => 0.25, // selects A
+      now: () => 1000,
+      lockManager: lock, // KeyLockCoordinator — reads live lock status
+      onStateChange: (snap) => {
+        snapshots.push(snap.map((s) => ({ name: s.name, locked: s.locked })))
+      },
+    })
+    // 400 (non-retryable) → acquire A, then release+throw. NO report* is called
+    // on this path, so the ONLY way a snapshot shows "a" locked=true is an
+    // explicit notify right after acquire (the behavior under test).
+    const mockFetch = async (): Promise<Response> =>
+      new Response('{"error":{"message":"bad request"}}', { status: 400 })
+    const model = createTestModel({
+      keys,
+      fetchFn: mockFetch as typeof fetch,
+      random: () => 0.25,
+      keyManager,
+      lockManager: lock, // LockLifecycleCoordinator — acquire/release
+      setInterval: () => "h1",
+      clearInterval: () => {},
+    })
+
+    await expect(model.doGenerate({ prompt: PROMPT } as any)).rejects.toThrow(/400|bad request/i)
+
+    // A snapshot was emitted where key "a" is locked (proves acquire → notify).
+    const aLocked = snapshots.some((snap) => snap.find((s) => s.name === "a")?.locked === true)
+    expect(aLocked).toBe(true)
+  })
+
+  test("after lock release (stream close), onStateChange receives a snapshot with the key unlocked", async () => {
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const lock = makeStatefulFakeLock()
+    const snapshots: Array<Array<{ name: string; locked: boolean }>> = []
+    const keyManager = new KeyManager({
+      keys,
+      random: () => 0.25,
+      now: () => 1000,
+      lockManager: lock,
+      onStateChange: (snap) => {
+        snapshots.push(snap.map((s) => ({ name: s.name, locked: s.locked })))
+      },
+    })
+    const mockFetch = async (): Promise<Response> => successSSE("ok")
+    const model = createTestModel({
+      keys,
+      fetchFn: mockFetch as typeof fetch,
+      random: () => 0.25,
+      keyManager,
+      lockManager: lock,
+      setInterval: () => "h1",
+      clearInterval: () => {},
+    })
+
+    await model.doGenerate({ prompt: PROMPT } as any)
+
+    // After the stream closes, the lock is released → a snapshot shows "a" unlocked.
+    // reportSuccess emits while locked, so only an explicit release→notify produces
+    // a locked=false snapshot.
+    const aUnlockedAtEnd = snapshots.some((snap) => snap.find((s) => s.name === "a")?.locked === false)
+    expect(aUnlockedAtEnd).toBe(true)
+    // And the lock really was released (not just reported).
+    expect(lock._lockedSet.has("a")).toBe(false)
+  })
+
+  test("no onStateChange callback → lock acquire/release still work, no crash", async () => {
+    const keys: KeyEntry[] = [
+      { name: "a", key: "user_test_aaaa" },
+      { name: "b", key: "user_test_bbbb" },
+    ]
+    const lock = makeStatefulFakeLock()
+    // KeyManager WITHOUT onStateChange — notifyStateChange must be a safe no-op.
+    const keyManager = new KeyManager({
+      keys,
+      random: () => 0.25,
+      now: () => 1000,
+      lockManager: lock,
+    })
+    const mockFetch = async (): Promise<Response> => successSSE("ok")
+    const model = createTestModel({
+      keys,
+      fetchFn: mockFetch as typeof fetch,
+      random: () => 0.25,
+      keyManager,
+      lockManager: lock,
+      setInterval: () => "h1",
+      clearInterval: () => {},
+    })
+
+    const result = await model.doGenerate({ prompt: PROMPT } as any)
+    expect(result.content.length).toBeGreaterThan(0)
+    // Lock still acquired + released despite no state bridge.
+    expect(lock._lockedSet.has("a")).toBe(false)
   })
 })

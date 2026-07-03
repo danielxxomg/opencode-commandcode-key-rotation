@@ -8,17 +8,15 @@
  * All functions are pure — same input → same output, no side effects.
  */
 
-import type { KeyState } from "./server.js"
+import type { KeyState, NotificationsConfig } from "./server.js"
 import { DEFAULT_NOTIFICATIONS } from "./server.js"
+
+// Re-export so existing import sites (`from "./ui-logic.js"`) keep working.
+export type { NotificationsConfig }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-export interface NotificationsConfig {
-  onRotate: boolean
-  onCooldown: boolean
-  onRecovery: boolean
-  onPermanentDeath: boolean
-}
+// (NotificationsConfig now comes from server.ts — single source of truth.)
 
 // ─── getHealthEmoji ───────────────────────────────────────────────────────────
 
@@ -56,6 +54,74 @@ export function redactForDisplay(key: string): string {
   return key.slice(0, 5) + "…" + key.slice(-4)
 }
 
+// ─── Phase 3 formatters (pure) ────────────────────────────────────────────────
+
+/**
+ * Compact a token count: values >= 100 are shown in thousands with a `k` suffix
+ * (one decimal, trailing `.0` stripped); smaller values are shown verbatim.
+ * e.g. 1200 → "1.2k", 800 → "0.8k", 1000 → "1k", 50 → "50", 0 → "0".
+ */
+function compactTokens(n: number): string {
+  if (n >= 100) {
+    return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k`
+  }
+  return String(n)
+}
+
+/**
+ * Format an estimated USD cost as "$X.XX" (2 decimals). `undefined` → "$0.00".
+ * Always labeled "est. cost" in surrounding UI — this is local estimation, not billing.
+ */
+export function formatCost(usd: number | undefined): string {
+  return `$${(usd ?? 0).toFixed(2)}`
+}
+
+/**
+ * Format input/output token counts as a compact "in/out" pair.
+ * e.g. (1200, 800) → "1.2k/0.8k", (0, 0) → "0/0".
+ */
+export function formatTokens(
+  input: number | undefined,
+  output: number | undefined,
+): string {
+  return `${compactTokens(input ?? 0)}/${compactTokens(output ?? 0)}`
+}
+
+/**
+ * Format per-model usage as a multi-line breakdown.
+ * Each line: "{modelId}: ${cost} ({totalTokens} tok)".
+ * Empty input → "" (caller conditionally renders the section).
+ */
+export function formatModelBreakdown(
+  modelUsage: Record<string, { inputTokens: number; outputTokens: number; costUSD: number }>,
+): string {
+  const entries = Object.entries(modelUsage)
+  if (entries.length === 0) return ""
+  return entries
+    .map(([id, mu]) => {
+      const total = (mu.inputTokens ?? 0) + (mu.outputTokens ?? 0)
+      return `${id}: ${formatCost(mu.costUSD)} (${compactTokens(total)} tok)`
+    })
+    .join("\n")
+}
+
+/**
+ * Format a lock owner (instance UUID) for display. Truncated to the first 8
+ * chars; null/undefined/empty → "—" (em dash) for unlocked keys.
+ */
+export function formatLockOwner(owner: string | null | undefined): string {
+  if (!owner) return "—"
+  return owner.length <= 8 ? owner : owner.slice(0, 8)
+}
+
+/**
+ * Format the locked-key count for the sidebar. Returns "🔒 N locked" when one
+ * or more keys are locked, "" (empty) when zero — so a clean state stays clean.
+ */
+export function formatLockCount(lockedCount: number): string {
+  return lockedCount > 0 ? `🔒 ${lockedCount} locked` : ""
+}
+
 // ─── formatKeyStatus ─────────────────────────────────────────────────────────
 
 /**
@@ -85,7 +151,20 @@ export function formatKeyStatus(state: KeyState): string {
     activeDisplay += ` ${healthEmoji}`
   }
 
-  return `🔑 ${activeDisplay} | 📊 ${total} ${keyWord} | ${healthy} healthy`
+  const base = `🔑 ${activeDisplay} | 📊 ${total} ${keyWord} | ${healthy} healthy`
+
+  // Phase 3: cost + lock indicators. Only appended when the state carries
+  // phase-3 data (a cost/lock field on any key) so old key-state.json files
+  // render identically to phase 1+2 (backward compatible).
+  const hasPhase3Data = state.keys.some(
+    (k) => k.totalCostUSD !== undefined || k.locked !== undefined,
+  )
+  if (!hasPhase3Data) return base
+
+  const totalCost = state.keys.reduce((sum, k) => sum + (k.totalCostUSD ?? 0), 0)
+  const lockedCount = state.keys.filter((k) => k.locked === true).length
+  const lockSuffix = formatLockCount(lockedCount)
+  return `${base} | 💰 ${formatCost(totalCost)}${lockSuffix ? ` | ${lockSuffix}` : ""}`
 }
 
 // ─── shouldShowToast ─────────────────────────────────────────────────────────
@@ -109,6 +188,8 @@ export function shouldShowToast(
       return config.onRecovery
     case "permanent-death":
       return config.onPermanentDeath
+    case "lock-release":
+      return config.onLockRelease
     default:
       return false
   }
@@ -117,7 +198,12 @@ export function shouldShowToast(
 // ─── decideToast ───────────────────────────────────────────────────────────
 
 /** Possible event types the TUI monitors. */
-export type ToastEventType = "rotate" | "cooldown" | "recovery" | "permanentDeath"
+export type ToastEventType =
+  | "rotate"
+  | "cooldown"
+  | "recovery"
+  | "permanentDeath"
+  | "lockRelease"
 
 /** Context passed by the caller — what changed. */
 export interface ToastEventContext {
@@ -158,10 +244,14 @@ export function decideToast(
   }
 
   const config = state.notifications ?? DEFAULT_NOTIFICATIONS
-  const show = shouldShowToast(
-    eventType === "permanentDeath" ? "permanent-death" : eventType,
-    config,
-  )
+  // Map camelCase event types to the kebab-case keys shouldShowToast expects.
+  const gateKey =
+    eventType === "permanentDeath"
+      ? "permanent-death"
+      : eventType === "lockRelease"
+        ? "lock-release"
+        : eventType
+  const show = shouldShowToast(gateKey, config)
 
   if (!show) {
     return { show: false, variant: "info", title: "", message: "" }
@@ -199,6 +289,13 @@ export function decideToast(
         title: "Key Dead",
         message: `${ctx.keyName} permanently failed (auth error)`,
       }
+    case "lockRelease":
+      return {
+        show: true,
+        variant: "info",
+        title: "Lock Released",
+        message: `🔓 Key '${ctx.keyName ?? "unknown"}' lock released`,
+      }
   }
 }
 
@@ -207,8 +304,11 @@ export function decideToast(
 /**
  * Format a detailed multi-line table for the /key-status command.
  *
- * Columns: Marker, Name, Account, Health (emoji), Score, Cooldown, Status
- * Active key is marked with "◄".
+ * Columns (phase 1+2): Marker, Name, Account, Health (emoji), Score, Cooldown, Status
+ * Phase 3 (when any key carries cost/lock data): adds Tokens(in/out), Est. Cost,
+ * Lock Owner columns + a Summary section (total est. cost, total tokens, top
+ * model) + a per-model breakdown. Cost is labeled "est. cost" — local
+ * estimation, not billing. Active key is marked with "◄".
  */
 export function formatKeyStatusTable(state: KeyState): string {
   if (state.keys.length === 0) {
@@ -216,8 +316,9 @@ export function formatKeyStatusTable(state: KeyState): string {
   }
 
   const now = Date.now()
-  const header = "  Name           Account         Health  Score  Cooldown   Status"
-  const separator = "  ─────────────  ───────────────  ──────  ─────  ─────────  ──────"
+  const hasPhase3Data = state.keys.some(
+    (k) => k.totalCostUSD !== undefined || k.locked !== undefined,
+  )
 
   const rows = state.keys.map((k) => {
     const marker = k.name === state.activeKey ? "◄" : " "
@@ -239,11 +340,64 @@ export function formatKeyStatusTable(state: KeyState): string {
     }
 
     const status = k.health === "healthy" ? "active" : k.health
+    const base = `  ${marker} ${k.name.padEnd(13)}  ${account}  ${emoji}      ${score}  ${cooldown.padEnd(9)}  ${(status as string).padEnd(12)}`
 
-    return `  ${marker} ${k.name.padEnd(13)}  ${account}  ${emoji}      ${score}  ${cooldown.padEnd(9)}  ${status}`
+    if (!hasPhase3Data) return base
+
+    const tokens = formatTokens(k.totalInputTokens, k.totalOutputTokens)
+    const cost = formatCost(k.totalCostUSD)
+    const owner = formatLockOwner(k.lockOwner ?? null)
+    return `${base}  ${tokens.padEnd(13)}  ${cost.padEnd(9)}  ${owner}`
   })
 
-  return [header, separator, ...rows].join("\n")
+  // Phase 1+2: legacy header, no summary/breakdown (backward compatible).
+  if (!hasPhase3Data) {
+    const header = "  Name           Account         Health  Score  Cooldown   Status"
+    const separator = "  ─────────────  ───────────────  ──────  ─────  ─────────  ──────"
+    return [header, separator, ...rows].join("\n")
+  }
+
+  const header =
+    "  Name           Account         Health  Score  Cooldown   Status        Tokens(in/out)  Est. Cost  Lock Owner"
+  const separator =
+    "  ─────────────  ───────────────  ──────  ─────  ─────────  ──────        ──────────────  ─────────  ──────────"
+  const lines = [header, separator, ...rows]
+
+  // ── Summary section ──────────────────────────────────────────────────────
+  const totalCost = state.keys.reduce((sum, k) => sum + (k.totalCostUSD ?? 0), 0)
+  const totalIn = state.keys.reduce((sum, k) => sum + (k.totalInputTokens ?? 0), 0)
+  const totalOut = state.keys.reduce((sum, k) => sum + (k.totalOutputTokens ?? 0), 0)
+
+  // Aggregate per-model usage across all keys (for breakdown + top model).
+  const aggUsage: Record<string, { inputTokens: number; outputTokens: number; costUSD: number }> = {}
+  for (const k of state.keys) {
+    for (const [modelId, mu] of Object.entries(k.modelUsage ?? {})) {
+      if (!aggUsage[modelId]) {
+        aggUsage[modelId] = { inputTokens: 0, outputTokens: 0, costUSD: 0 }
+      }
+      aggUsage[modelId]!.inputTokens += mu.inputTokens
+      aggUsage[modelId]!.outputTokens += mu.outputTokens
+      aggUsage[modelId]!.costUSD += mu.costUSD
+    }
+  }
+  const topModel = Object.entries(aggUsage).sort((a, b) => b[1].costUSD - a[1].costUSD)[0]
+  const topModelStr = topModel ? `${topModel[0]} (${formatCost(topModel[1].costUSD)})` : "—"
+
+  lines.push("")
+  lines.push("  Summary")
+  lines.push(
+    `  Total est. cost: ${formatCost(totalCost)}  |  Total tokens: ${formatTokens(totalIn, totalOut)}  |  Top model: ${topModelStr}`,
+  )
+
+  // ── Model breakdown section ──────────────────────────────────────────────
+  const breakdown = formatModelBreakdown(aggUsage)
+  if (breakdown) {
+    lines.push("")
+    lines.push("  Model breakdown")
+    for (const line of breakdown.split("\n")) lines.push(`  ${line}`)
+  }
+
+  return lines.join("\n")
 }
 
 // ─── decideConfigWarning (C10) ───────────────────────────────────────────────
