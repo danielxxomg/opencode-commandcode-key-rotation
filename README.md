@@ -1,75 +1,127 @@
 # Command Code Key Rotation Plugin
 
-> OpenCode plugin for automatic API key rotation with session continuity, TUI integration, and multi-instance coordination.
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6.svg)
+![Bun](https://img.shields.io/badge/Bun-%3E%3D1.0.0-fbf0d9.svg)
+![Tests](https://img.shields.io/badge/tests-115%20pass-brightgreen.svg)
+![Coverage](https://img.shields.io/badge/coverage-%3E80%25-brightgreen.svg)
+![Strict TDD](https://img.shields.io/badge/TDD-strict-orange.svg)
+
+> OpenCode plugin for automatic API key rotation across multiple Command Code accounts — with session continuity, sub-agent transparency, and TUI integration.
+
+> [!WARNING]
+> This plugin **modifies the `commandcode-retry` provider** (a local fork of `commandcode-go-opencode-provider`). If the upstream provider releases changes, you'll need to re-apply the key-rotation patch. The modified provider is fully backward-compatible: when no `apiKeys[]` are configured, it behaves identically to the original single-key provider.
 
 ## Problem
 
-Command Code plans have session limits. When a key expires, OpenCode freezes — losing your session context. Sub-agents die mid-task, losing their entire thought chain.
+Command Code plans have **5-hour session limits**. When the active key hits its limit, OpenCode freezes with an error. Two critical failure modes:
+
+1. **Main session stall** — you must manually run `/connect` to switch keys, which cancels the current session and loses context.
+2. **Sub-agent death** — when a sub-agent's key expires mid-task, the entire agent session terminates. The thought chain, context, and progress are permanently lost.
+
+Both problems require **transparent key swapping at the provider level** — before errors propagate to the AI SDK.
 
 ## Solution
 
-Provider-level key rotation that's transparent to both main sessions and sub-agents:
+Provider-level key rotation that's transparent to both main sessions and sub-agents. Sub-agents share the parent's provider instance (verified at [opencode `provider.ts:1809`](https://github.com/anomalyco/opencode) — `getLanguage()` caches `LanguageModelV3` instances), so provider-level rotation benefits them automatically.
+
+## How It Works
 
 ```
-Key exhausted → fetchWithRetry() detects 429/quota
-  → Suppress error (don't propagate to AI SDK)
-  → KeyManager selects next healthy key
-  → Re-fetch with new key
-  → Toast notifies you
-  → Sub-agent continues normally — never knows a switch happened
+1. Request sent with key A
+2. Command Code responds 429 / quota-exceeded
+3. fetchWithRetry() detects quota error (does NOT consume retry attempt)
+4. KeyManager.markRateLimited(key A) → key A enters cooldown
+5. KeyManager.selectKey() → weighted-random picks key B
+6. buildHeaders(key B) → re-fetch with new key (retry budget untouched)
+7. Toast: "Key Rotated: A → B (rate limited)"
+8. Sub-agent continues normally — never knows a switch happened
 ```
 
-## Architecture
+**Why not a plugin hook?** The `chat.headers` plugin hook can't see responses and can't detect failures. The `auth.loader` custom-fetch only works for bundled SDK providers — `commandcode-retry` calls `globalThis.fetch` directly, bypassing it. Only provider-level interception in `fetchWithRetry()` solves both the main-session and sub-agent problems.
 
-| Layer | Location | Role |
-|-------|----------|------|
-| **Provider** | `providers/commandcode-retry/` | KeyManager + fetchWithRetry key swap |
-| **Server Plugin** | `providers/commandcode-key-rotation/server.ts` | Config hook, event monitoring, toast |
-| **TUI Plugin** | `providers/commandcode-key-rotation/ui.tsx` | Sidebar footer, `/key-status`, kv persistence |
+## Prerequisites
 
-Key rotation happens **inside the provider** (`fetchWithRetry()`), not in a plugin hook — the only interception point that works transparently for sub-agents.
+- [OpenCode](https://opencode.ai) installed and working
+- [Bun](https://bun.sh) >= 1.0.0 (runtime + test runner)
+- A [Command Code](https://commandcode.ai) account with at least one API key
+- 2+ API keys across accounts (for rotation to be useful)
 
 ## Quick Start
 
 ```bash
-# 1. Install
+# 1. Clone
+git clone https://github.com/danielxxomg/opencode-commandcode-key-rotation.git
+cd opencode-commandcode-key-rotation
+
+# 2. Install — copies providers into ~/.config/opencode/providers/
 ./install.sh
 
-# 2. Set up keys
+# 3. Set up keys
 cp providers/commandcode-key-rotation/keys.json.example ~/.commandcode/keys.json
-# Edit with your real keys
+# Edit with your real keys (see Configuration below)
 
-# 3. Register in ~/.config/opencode/opencode.json
-#    plugin: ["commandcode-key-rotation/server"]
-#    provider.commandcode.npm: "file:./providers/commandcode-retry"
+# 4. Register in ~/.config/opencode/opencode.json
+#    Add "commandcode-key-rotation/server" and "commandcode-key-rotation/tui" to the plugin array
+#    Ensure provider.commandcode.npm points to the modified provider
 
-# 4. Restart OpenCode
+# 5. Restart OpenCode
 ```
 
 ## Configuration
 
 ### `~/.commandcode/keys.json`
 
+Multi-key config with rotation and notification settings:
+
 ```json
 {
+  "$schema": "https://opencode.ai/config.json",
   "keys": [
-    { "name": "personal", "key": "user_****xxxx", "account": "myaccount" },
-    { "name": "work",     "key": "user_****yyyy", "account": "work-org" }
+    { "name": "personal", "key": "user_YOUR_KEY_1", "account": "myaccount" },
+    { "name": "work",     "key": "user_YOUR_KEY_2", "account": "work-org" },
+    { "name": "backup",   "key": "user_YOUR_KEY_3", "account": "myaccount" }
   ],
   "rotation": {
     "strategy": "weighted-random",
     "cooldownMs": 60000,
     "cooldownFromRetryAfter": true,
-    "serverErrorCooldownMs": 10000
+    "serverErrorCooldownMs": 10000,
+    "scoreDecayPerHour": 1,
+    "maxSuccessBonus": 50
+  },
+  "notifications": {
+    "onRotate": true,
+    "onCooldown": true,
+    "onRecovery": true,
+    "onPermanentDeath": true
   }
 }
 ```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `keys[].name` | — | Human-readable identifier (shown in TUI/toasts) |
+| `keys[].key` | — | Command Code API key (`user_…`) |
+| `keys[].account` | — | Associated account name (shown in TUI) |
+| `rotation.strategy` | `weighted-random` | Selection algorithm (only `weighted-random` supported) |
+| `rotation.cooldownMs` | `60000` | Cooldown duration after 429 (ms) |
+| `rotation.cooldownFromRetryAfter` | `true` | Respect `Retry-After` header if present (capped at 300s) |
+| `rotation.serverErrorCooldownMs` | `10000` | Cooldown after 5xx server errors (ms) |
+| `rotation.scoreDecayPerHour` | `1` | Health score decay for inactivity |
+| `rotation.maxSuccessBonus` | `50` | Max bonus from successful requests |
+| `notifications.*` | `true` | Toggle toast notifications per event type |
 
 ### `~/.config/opencode/opencode.json`
 
 ```json
 {
-  "plugin": ["commandcode-key-rotation/server"],
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "commandcode-go-opencode-provider/server",
+    "commandcode-key-rotation/server",
+    "commandcode-key-rotation/tui"
+  ],
   "provider": {
     "commandcode": {
       "npm": "file:./providers/commandcode-retry",
@@ -79,43 +131,256 @@ cp providers/commandcode-key-rotation/keys.json.example ~/.commandcode/keys.json
 }
 ```
 
+> [!NOTE]
+> If `keys.json` is missing or malformed, the plugin falls back to legacy single-key mode (uses `COMMANDCODE_API_KEY` env var or `~/.commandcode/auth.json`). No crash — just a warning toast.
+
+## Architecture
+
+| Layer | Location | Role |
+|-------|----------|------|
+| **Provider** | `providers/commandcode-retry/src/key-manager.ts` | KeyManager: health scoring, weighted random selection, cooldown, permanent death, hot-reload |
+| **Provider** | `providers/commandcode-retry/src/model.ts` | `fetchWithRetry()` + `streamWithReconnect()` key swap on 429/quota/auth errors |
+| **Provider** | `providers/commandcode-retry/index.ts` | Factory: accepts `apiKeys[]`, constructs KeyManager, backward-compat single `apiKey` |
+| **Server Plugin** | `providers/commandcode-key-rotation/server.ts` | Config hook reads `keys.json`, event hook monitors `session.error`, atomic `key-state.json` |
+| **TUI Plugin** | `providers/commandcode-key-rotation/ui.tsx` | `sidebar_footer` slot, toast notifications, `/key-status`, `/key-dismiss` |
+| **TUI Logic** | `providers/commandcode-key-rotation/ui-logic.ts` | Pure functions: formatting, redaction, toast decisions, notification gating |
+
+Key rotation happens **inside the provider** (`fetchWithRetry()`), not in a plugin hook — the only interception point that works transparently for sub-agents.
+
 ## Rotation Strategy
 
-**Weighted random** selection prevents thundering herd. Each key has a health score:
+**Weighted random** selection prevents thundering herd when multiple instances share keys. Each key maintains a persistent health score:
 
-| Event | Effect |
-|-------|--------|
-| Successful request | +0.1 bonus (capped at +50) |
-| HTTP 429 (rate limit) | -10 penalty, cooldown applied |
-| 429 + `Retry-After` | Respects header value |
-| 401/403 (auth failure) | Permanent death |
-| 5xx (server error) | -5 penalty, 10s cooldown |
-| Inactivity | -1 per hour |
+```
+score = 100
+      + (successes × 0.1)         // bonus for successful use (capped at +50)
+      − (rateLimitHits × 10)      // penalty per 429
+      − (authErrors × 1000)       // nuclear penalty for auth failures
+      − (agePenalty)              // mild penalty for inactivity (1 point/hour)
+```
+
+| Event | Effect | Cooldown | Notification |
+|-------|--------|----------|-------------|
+| Successful request | +0.1 bonus (capped at +50) | — | — |
+| HTTP 429 (rate limit) | -10 penalty | 60s (configurable) | `Key 'name' rate limited — cooling down 60s` |
+| 429 + `Retry-After` header | -10 penalty | Header value (capped 300s) | `Key 'name' rate limited — retry after Xs` |
+| 401/403 (auth failure) | -1000 penalty | Permanent (∞) | `Key 'name' auth failed — permanently disabled` |
+| 5xx (server error) | -5 penalty | 10s (configurable) | `Key 'name' server error — retrying in 10s` |
+| Success after cooldown | Reset | — | `Key 'name' back online` |
+| Inactivity | -1 per hour | — | — |
+
+**Selection algorithm (`selectKey()`):**
+
+1. Filter out permanently-dead keys and keys in cooldown
+2. If none eligible → use least-recently-cooldowned non-dead key (emergency fallback + warning)
+3. If single key eligible → return it directly (no random)
+4. If all eligible keys have score 0 → uniform random (avoid divide-by-zero)
+5. Weighted random: `P(key_i) = score_i / Σscores`
+6. If all keys permanently dead → fatal error listing all keys + status
 
 ## Edge Cases
 
 | Case | Behavior |
 |------|----------|
-| All keys in cooldown | Use least-recently-blocked, warn user |
-| Single key available | Use it always, warn if score low |
+| All keys in cooldown | Use least-recently-blocked non-dead key, warn user |
+| Single key available | Use it always (no random), warn if score low |
 | Permanently dead key | Exclude from pool, notify once |
-| All permanently dead | Fatal error, show all key statuses |
+| All permanently dead | Fatal error, show all keys and their status |
 | New key (no history) | Score 100, immediately eligible |
-| Config hot-reload | Key added/removed without restart |
+| Config hot-reload | `keys.json` changes → next `selectKey()` reads updated config (file mtime check) |
+| Mid-stream exhaustion (before content) | Swap key + reconnect |
+| Mid-stream exhaustion (after content) | `partialOutputError()` — cannot reconnect (duplicate-content risk) |
+| Malformed `keys.json` | Fall back to single-key legacy mode + warning toast |
+| `Retry-After` header present | Use header value as cooldown (capped at 300s) |
 
 ## TUI
 
-- **Sidebar footer**: current key, account, health summary
-- **Toast notifications**: key rotation, cooldown, recovery, permanent death
-- **`/key-status` command**: detailed view of all keys
+### Sidebar Footer
+
+Shows the active key with health indicator:
+
+```
+┌─ Key Rotation ────────────┐
+│ personal (myaccount) ✅   │
+│ 📊 3 keys | 2 healthy     │
+└───────────────────────────┘
+```
+
+### Toast Notifications
+
+```
+⚠️ Key Rotated: 'personal' → 'work' (rate limited)
+✅ Key Restored: 'personal' back online
+🔴 Key Disabled: 'backup' auth failed — permanently removed
+⚠️ Configuration Warning: keys.json is malformed — using single-key mode
+```
+
+### Commands
+
+- **`/key-status`** — detailed view of all keys (name, account, health, score, cooldown, status)
+- **`/key-dismiss`** — dismiss a notification type (persists across sessions via `api.kv`)
+
+## Debugging
+
+To capture real Command Code error response bodies (for refining error patterns):
+
+```bash
+# Enable dev-mode error logging
+COMMANDCODE_DEV_LOG=1 opencode
+```
+
+This logs the full HTTP status + response body (with API keys redacted to last 4 chars: `user_…xxxx`) whenever an error response is received. Use this to:
+
+- Verify whether Command Code sends `Retry-After` headers on 429
+- Capture the exact error message for the 5-hour session limit
+- Refine `QUOTA_PATTERNS` in `src/model.ts` based on real responses
+
+> [!IMPORTANT]
+> Dev-mode logs redact API keys in the **current key** and in the **response body** (via `redactBody()` which replaces `user_XXXX...` patterns). Never share raw dev logs without reviewing them first.
+
+## Troubleshooting
+
+### Keys don't rotate — still using single key
+
+- Verify `~/.commandcode/keys.json` exists and is valid JSON (`python -m json.tool ~/.commandcode/keys.json`)
+- Verify `apiKeys[]` is being injected: check the provider config hook ran (look for the sidebar footer showing key count > 1)
+- If `keys.json` is malformed, the plugin falls back to single-key mode with a warning toast
+
+### 429 errors still reach OpenCode (rotation not happening)
+
+- The error might not match `QUOTA_PATTERNS`. Enable dev-mode logging (`COMMANDCODE_DEV_LOG=1`) to capture the actual response body and add the pattern to `src/model.ts`
+- All keys might be in cooldown simultaneously (all hit the 5-hour limit). The emergency fallback uses the least-recently-cooldowned key, but if all are exhausted, errors will propagate
+- `MAX_KEY_SWAPS` (`keys.length + 1`) may have been exceeded — if all keys returned 429 in one request cycle, the fatal error is intentional
+
+### Sub-agent dies on key exhaustion
+
+- This should NOT happen — sub-agents share the provider instance. If it does, verify no separate provider instance is being created. Check that the provider `npm` path resolves to `commandcode-retry` (the modified one), not the upstream `commandcode-go-opencode-provider`
+- If the key exhaustion happens mid-stream AFTER content was emitted, `partialOutputError()` is unavoidable — the sub-agent will receive a partial output error. This is a known limitation (see Edge Cases)
+
+### TUI sidebar not showing
+
+- Verify `commandcode-key-rotation/tui` is in the plugin array (not just `/server`)
+- Verify `@opentui/solid` is available in the opencode runtime (it's provided by opencode, not installed locally)
+- Check that `key-state.json` is being written: `cat ~/.commandcode/key-state.json`
+
+### Toast notifications not appearing
+
+- Check `notifications` config in `keys.json` — all 4 types default to `true`
+- If you dismissed a notification type via `/key-dismiss`, it's persisted in `api.kv`. Run `/key-dismiss` again to toggle it back on
+
+## FAQ
+
+<details>
+<summary><b>Do I need to remove my existing single-key setup?</b></summary>
+
+No. The plugin is backward-compatible. If `keys.json` is absent or `apiKeys[]` is not provided, the provider falls back to legacy single-key mode using `COMMANDCODE_API_KEY` or `~/.commandcode/auth.json`. You can keep your existing setup as a fallback.
+</details>
+
+<details>
+<summary><b>How does this work with sub-agents?</b></summary>
+
+Sub-agents share the parent's `LanguageModelV3` instance (cached by opencode's `getLanguage()` at `provider.ts:1809`). Since key rotation happens inside the provider's `fetchWithRetry()`, sub-agents automatically use the rotated key — they never know a switch happened. No separate mechanism is needed.
+</details>
+
+<details>
+<summary><b>Can I run multiple OpenCode instances simultaneously?</b></summary>
+
+Yes, but with a known limitation: there's no cross-instance coordination (lock file is deferred to phase 3). Multiple instances may select the same key. Weighted-random selection partially mitigates thundering herd, but hard coordination is not yet implemented.
+</details>
+
+<details>
+<summary><b>What happens if all my keys hit the 5-hour limit at once?</b></summary>
+
+All keys enter cooldown. The emergency fallback uses the least-recently-cooldowned key (the one closest to recovery). You'll see a warning toast. If all keys are permanently dead (auth errors), a fatal error is thrown listing all keys and their status — you must refresh your keys manually.
+</details>
+
+<details>
+<summary><b>Does this break the upstream provider?</b></summary>
+
+No. The modified `commandcode-retry` is a local fork. When no `apiKeys[]` are configured, it behaves identically to the original. The upstream `commandcode-go-opencode-provider` is untouched. To fully revert: remove the plugin from `opencode.json` and point the provider `npm` back to the upstream package.
+</details>
+
+<details>
+<summary><b>How do I add or remove keys without restarting?</b></summary>
+
+Edit `~/.commandcode/keys.json` and save. The KeyManager checks the file's modification time on each `selectKey()` call and hot-reloads if the file changed. No restart needed.
+</details>
+
+## Development
+
+```bash
+# Clone
+git clone https://github.com/danielxxomg/opencode-commandcode-key-rotation.git
+cd opencode-commandcode-key-rotation
+
+# Run tests (provider)
+cd providers/commandcode-retry
+bun test
+bun test --coverage
+
+# Run tests (plugin)
+cd ../commandcode-key-rotation
+bun test
+bun test --coverage
+
+# Typecheck both
+bunx tsc --noEmit
+
+# Link locally for development
+# Point opencode.json provider npm to your local path:
+#   "npm": "file:///absolute/path/to/opencode-commandcode-key-rotation/providers/commandcode-retry"
+```
+
+### Test Architecture
+
+- **115 tests** (35 provider + 80 plugin), all passing
+- **Coverage ≥80%** on all modified files (key-manager 100%, model 94%, server 96%, ui-logic 99%)
+- **Strict TDD** — tests written first (Red-Green-Refactor)
+- **Dependency injection** for determinism: `fetchFn`, `sleep`, `now`, `random` injected (Bun has no fake timers)
+- **Pure functions** extracted from TUI components for unit testing (Solid.js render is not unit-tested)
+
+## Updating
+
+```bash
+# Pull latest
+git pull origin main
+
+# Re-run install to copy updated providers
+./install.sh
+
+# Restart OpenCode
+```
+
+If you installed via `npm` cache and need a fresh install:
+
+```bash
+rm -rf ~/.cache/opencode/node_modules/commandcode-key-rotation
+opencode  # triggers fresh install
+```
+
+## Security
+
+- **API keys are secrets** — stored in `~/.commandcode/keys.json` (outside any git repo). Never commit keys.
+- **Test fixtures use fake keys** (`user_test_…`) — no real keys in the repository.
+- **Redaction in logs**: API keys are redacted to last 4 chars (`user_…xxxx`) in all logs and TUI display.
+- **Dev-mode body redaction**: `redactBody()` replaces `user_XXXX…` patterns in error response bodies before logging (defense in depth — catches keys not in the pool).
+- **Authorization header** is built per-request from the currently selected key — never cached globally beyond a single request.
+- **`keys.json.example`** uses placeholder keys only (`user_YOUR_KEY`).
 
 ## Dependencies
 
 | Package | Purpose |
 |---------|---------|
-| `commandcode-go-opencode-provider` (fork) | Base provider — modified with KeyManager |
-| `@opencode-ai/plugin` | Plugin API (toast, slots, kv, keymap) |
-| `@opentui/solid` | Solid.js for TUI sidebar component |
+| `commandcode-go-opencode-provider` (fork) | Base provider — modified with KeyManager + key swap |
+| `@opencode-ai/plugin` | Plugin API (toast, slots, kv, keymap) — provided by opencode runtime |
+| `@opentui/solid` | Solid.js for TUI sidebar component — provided by opencode runtime |
+| `ai` SDK >=6.0.0 | `LanguageModelV3` interface (peer dependency) |
+
+## Related
+
+- **Upstream provider**: [brent-weatherall/opencode-commandcode-provider](https://github.com/brent-weatherall/opencode-commandcode-provider) — original
+- **Fork**: [danielxxomg/opencode-commandcode-provider](https://github.com/danielxxomg/opencode-commandcode-provider) — retry/backoff patches (PR #10, PR #11)
+- **Reference pattern**: [masrurimz/opencode-go-multi-auth](https://github.com/masrurimz/opencode-go-multi-auth) — multi-account rotation for OpenCode Go (different architecture: auth.loader + custom fetch, doesn't work for custom providers)
 
 ## License
 
